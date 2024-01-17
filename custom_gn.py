@@ -1,6 +1,6 @@
 import torch.nn as nn
 import torch
-import time, os, itertools
+import datetime, time, os, itertools
 torch.set_printoptions(sci_mode=False)
 module_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -140,7 +140,9 @@ if __name__ == '__main__':
         #g2_grad_wrt_b = torch.autograd.grad(g2.sum(), gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
         #print(g1_grad_wrt_b - g2_grad_wrt_b)
 
-    NSEC = 20
+    NSEC = 1 # number of seconds that each kernel runs for on a certain input
+    outfile = open(datetime.datetime.now().strftime("%H-%M-%S-%d-%m-%Y.csv"), 'w')
+    outfile.write('Kernel,B (batch),C (num channels),R (resolution),G (num groups), D (C/G),Speed (it/s)\n')
     if MODE != 'check':
         for B, C, R, G in itertools.product(
                 [1, 2, 4, 8, 16, 32],
@@ -157,7 +159,7 @@ if __name__ == '__main__':
             x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
             gn_args = (G, C)
             BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
-            print(BENCH, x_nchw.shape)
+            print(BENCH, 'X shape:', x_nchw.shape, 'G (num groups):', G)
             for gn_class, gn_input, desc, fwd_fn in (
                     (GN_NHWC, x_nhwc, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
                     (GN_NHWC, x_nhwc, 'GN NHWC N grid (custom op)', gn_op.fwd_N_grid),
@@ -198,7 +200,11 @@ if __name__ == '__main__':
                     ntrials += 1
 
                     if time.time() - tic_sec > 1:
-                        print(f'{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {ntrials/(time.time() - tic)} it/s\r', end='')
+                        speed = round(ntrials / (time.time() - tic), 2)
+                        print(f'{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {speed} it/s\r', end='')
                         tic_sec = time.time()
-                print(f'\nSpeed: {ntrials / NSEC} it/s')
+                speed = round(ntrials / NSEC, 2)
+                print(f'\nSpeed: {speed} it/s')
+                outfile.write(f'{desc},{B},{C},{R},{G},{C//G},{speed}\n')
             print()
+        outfile.close()

@@ -11,7 +11,7 @@
 
 template <typename T>
 __global__ void
-NH_compute_stats(
+NH_compute_stats_pt1(
         const T* X,
         const int H,
         const int W,
@@ -100,7 +100,7 @@ NH_compute_stats(
 
 template <typename T>
 __global__ void
-NH_compute_stats(
+NH_compute_stats_pt2(
         at::native::WelfordData<at::acc_type<T, true>, int> *welford_data,
         const int H,
         const int G,
@@ -199,7 +199,7 @@ void NH_gn_fwd(
   blockDimX = MIN(TPB, C);
   blockDimY = TPB / blockDimX;
   f = MAX(C / TPB, 1); // note: impossible for f > 1 AND blockDimY > 1
-  NH_compute_stats<<<dim3(N, H, f), dim3(blockDimX, blockDimY)>>>(
+  NH_compute_stats_pt1<<<dim3(N, H, f), dim3(blockDimX, blockDimY)>>>(
       X_data, H, W, C, G, 
       welford_data
   );
@@ -207,7 +207,7 @@ void NH_gn_fwd(
   TPB = MIN(MAX_THREADS_PER_BLOCK, H * G / f);
   blockDimX = MIN(TPB, G / f);
   blockDimY = TPB / blockDimX;
-  NH_compute_stats<<<dim3(N, f), dim3(blockDimX, blockDimY)>>>(
+  NH_compute_stats_pt2<<<dim3(N, f), dim3(blockDimX, blockDimY)>>>(
           welford_data,
           H, G, eps,
           mean_data, rstd_data
