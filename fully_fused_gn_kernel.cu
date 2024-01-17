@@ -1,5 +1,6 @@
 #include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
 #include <c10/cuda/CUDAMathCompat.h> // rsqrt
+#include <ATen/cuda/Exceptions.h> // AT_CUDA_CHECK
 #include <ATen/AccumulateType.h> // acc_type
 #include <thrust/pair.h> // thrust::pair
 #include <torch/torch.h> // torch tensor
@@ -88,7 +89,7 @@ fused_kernel(
 }
 
 template <typename T>
-void gn_nhwc_forward_kernel_fused(
+void fused_gn_fwd(
     const torch::Tensor& X,
     const torch::Tensor& weight,
     const torch::Tensor& bias,
@@ -123,10 +124,10 @@ void gn_nhwc_forward_kernel_fused(
       H, W, C, G, eps,
       Y_data, mean_data, rstd_data
   );
-  //AT_CUDA_CHECK(cudaGetLastError());
+  AT_CUDA_CHECK(cudaGetLastError());
 }
 
-std::vector<torch::Tensor> gn_nhwc_cuda_forward_fused(
+std::vector<torch::Tensor> gn_nhwc_cuda_fwd_fused(
     const torch::Tensor& X,
     const torch::Tensor& weight,
     const torch::Tensor& bias,
@@ -143,8 +144,8 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward_fused(
     at::ScalarType::Half,
     at::ScalarType::BFloat16,
     X.scalar_type(),
-    "group_norm_nhwc_forward", [&]() {
-      gn_nhwc_forward_kernel_fused<scalar_t>(
+    "group_norm_nhwc_forward_fused", [&]() {
+      fused_gn_fwd<scalar_t>(
           X_nhwc,
           weight,
           bias,

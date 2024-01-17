@@ -1,6 +1,6 @@
 import torch.nn as nn
-import torch
-import datetime, time, os, itertools
+import numpy as np
+import torch, datetime, time, os, itertools
 torch.set_printoptions(sci_mode=False)
 module_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -27,7 +27,8 @@ gn_op = load(
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
     def choose_kernel(X: torch.Tensor, G: int):
-        return gn_op.fwd_NH_grid
+        return gn_op.fwd_NG_grid
+        #return gn_op.fwd_N_grid
         #if X.shape[0] <= 8: # and X.shape[2] * X.shape[3] >= 128 * 128: # and weight.dtype in (torch.bfloat16, torch.half):
         #    return gn_op.fwd_NH_grid
         #else:
@@ -55,13 +56,16 @@ class GN_NHWC(nn.GroupNorm):
         #print(x.shape, self.num_channels)
         N, C, H, W = x.shape
         G = self.num_groups
+
+        if C // G > 512:
+            raise ValueError(f'Error in fwd for X.shape={x.shape}, G={G}: C // G = {C // G} which is greater than 512. This input is not supported.')
+
         f = max(1, C // 512)
         bdx = min(G // f, 512)
-        d = min(H * G, 512) // bdx
-        if C // G > 512:
-            raise ValueError(f'C // G = {C // G} which is greater than 512. This input is not supported.')
+        d = min(H * G // f, 512) // bdx
         if W % d != 0:
-            raise ValueError(f'X[0] has width {W} which is not a multiple of {d}. This input is not supported.')
+            raise ValueError(f'Error in fwd for X.shape={x.shape}, G={G}: X has width {W} which is not a multiple of {d}. This input is not supported.')
+
         if self.affine:
             return GN_NHWC_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
         else:
@@ -101,10 +105,10 @@ if __name__ == '__main__':
     MODE = 'bench' # can be 'check', 'bench', other modes do both
 
     if MODE != 'bench':
-        B = 4
-        C = 256
-        R = 8
-        G = 32
+        B = 1
+        C = 512
+        R = 4
+        G = 2
         x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
         #torch.random.manual_seed(0)
 
@@ -140,71 +144,94 @@ if __name__ == '__main__':
         #g2_grad_wrt_b = torch.autograd.grad(g2.sum(), gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
         #print(g1_grad_wrt_b - g2_grad_wrt_b)
 
-    NSEC = 1 # number of seconds that each kernel runs for on a certain input
-    outfile = open(datetime.datetime.now().strftime("%H-%M-%S-%d-%m-%Y.csv"), 'w')
-    outfile.write('Kernel,B (batch),C (num channels),R (resolution),G (num groups), D (C/G),Speed (it/s)\n')
     if MODE != 'check':
-        for B, C, R, G in itertools.product(
-                [1, 2, 4, 8, 16, 32],
-                [32, 64, 128, 256, 512],
-                [4, 8, 16, 32, 64, 128, 256, 512],
-                [2, 4, 8, 16, 32, 64, 128]
-                ):
-            if B * C * R * R > 8 * 64 * 256 * 256:
-                continue
-            if G > C:
-                continue
+        NSEC = 5 # number of seconds that each kernel runs for on a certain input
+        BATCHES = [1, 2, 4, 8, 16, 32]
+        CHANNELS = [32, 64, 128, 256, 512]
+        RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
+        NUM_GROUPS = [4, 8, 16, 32, 64, 128]
+        GN_KERNELS = [
+                (GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
+                (GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
+                (GN_NHWC, 'GN NHWC N grid (custom op)', gn_op.fwd_N_grid),
+                (GN_NHWC, 'GN NHWC NG grid (custom op)', gn_op.fwd_NG_grid),
+                (GN_NCHW, 'torch.nn GN NCHW (compiled from src)', gn_op.nchwforward),
+        ]
 
+        os.makedirs('csvs', exist_ok=True)
+        fname = datetime.datetime.now().strftime("csvs/%H-%M-%S-%d-%m-%Y.csv")
+        print(f'Writing to {fname}')
+        outfile = open(fname, 'w')
+        outfile.write('Kernel,B (batch),C (num channels),R (resolution),G (num groups), D (C/G),Speed (it/s; 25th percentile),Speed (it/s; 50th percentile),Speed (it/s; 75th percentile)\n')
+
+        def config_filter(x): # returns true if config is valid
+            B, C, R, G = x
+            if G > C:
+                return False
+
+            dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
+            estimated_mem_usage_gib = (3 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
+            if estimated_mem_usage_gib > 4: # vram filter
+                return False
+            return True
+        
+        configs = list(filter(config_filter, itertools.product(BATCHES, CHANNELS, RESOLUTIONS, NUM_GROUPS)))
+        print('Estimated time (seconds) to complete:', NSEC * len(configs) * len(GN_KERNELS))
+
+        for B, C, R, G in configs:
             x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
+
             gn_args = (G, C)
             BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
             print(BENCH, 'X shape:', x_nchw.shape, 'G (num groups):', G)
-            for gn_class, gn_input, desc, fwd_fn in (
-                    (GN_NHWC, x_nhwc, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
-                    (GN_NHWC, x_nhwc, 'GN NHWC N grid (custom op)', gn_op.fwd_N_grid),
-                    (GN_NHWC, x_nhwc, 'GN NHWC NG grid (custom op)', gn_op.fwd_NG_grid),
-                    (GN_NCHW, x_nchw, 'torch.nn GN NCHW (compiled from src)', None),
-                    ):
+            for gn_class, desc, fwd_fn in GN_KERNELS:
+                gn_input = x_nchw if 'NCHW' in desc else x_nhwc
                 print(desc)
 
-                gn_layer = gn_class(*gn_args).cuda().to(DTYPE)
-
-                # Not calling gn_layer(gn_input) since I found this added a lot of overhead
-                if isinstance(gn_layer, GN_NHWC):
-                    g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                elif isinstance(gn_layer, GN_NCHW):
-                    g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                else:
+                try:
+                    gn_layer = gn_class(*gn_args).cuda().to(DTYPE)
                     g = gn_layer(gn_input)
-                torch.cuda.synchronize()
-
-                tic = time.time()
-                tic_sec = time.time()
-                ntrials = 0
-                while time.time() - tic < NSEC:
-                    if BENCH != 'bwd':
-                        if isinstance(gn_layer, GN_NHWC):
-                            g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        elif isinstance(gn_layer, GN_NCHW):
-                            g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        else:
-                            g = gn_layer(gn_input)
-                    if BENCH != 'fwd':
-                        if 'NHWC' in desc:
-                            g_mem_fmt = g.contiguous(memory_format=torch.channels_last) # in NHWC models, must convert possibly NCHW outputs into NHWC (i.e. from nn GN), note that this is a no-op if g is already in NHWC format (e.g. GN_NHWC output)
-                        else:
-                            g_mem_fmt = g.contiguous()
-                        torch.autograd.grad(g_mem_fmt.sum(), gn_input, retain_graph=True)
                     torch.cuda.synchronize()
-                    ntrials += 1
 
-                    if time.time() - tic_sec > 1:
-                        speed = round(ntrials / (time.time() - tic), 2)
-                        print(f'{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {speed} it/s\r', end='')
-                        tic_sec = time.time()
-                speed = round(ntrials / NSEC, 2)
-                print(f'\nSpeed: {speed} it/s')
-                outfile.write(f'{desc},{B},{C},{R},{G},{C//G},{speed}\n')
+                    tic = time.time()
+                    tic_sec = time.time()
+                    ntrials = 0
+                    ntrials_minor = 0
+                    minor_speeds = [] # used to track speed percentiles since they can often vary by a lot
+
+                    while time.time() - tic < NSEC:
+                        if BENCH != 'bwd':
+                            g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps) # Not calling gn_layer(gn_input) since I found this added a lot of overhead
+                        if BENCH != 'fwd':
+                            torch.autograd.grad(g_mem_fmt.sum(), gn_input, retain_graph=True)
+                        torch.cuda.synchronize()
+
+                        ntrials += 1
+                        ntrials_minor += 1
+
+                        if time.time() - tic_sec > 0.1:
+                            speed = round(ntrials_minor / (time.time() - tic_sec), 2)
+                            minor_speeds.append(speed)
+                            print(f'{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {speed} it/s\r', end='')
+                            ntrials_minor = 0
+                            tic_sec = time.time()
+
+                    minor_speeds = np.array(minor_speeds)
+                    median_speed = round(np.percentile(minor_speeds, 50), 2)
+                    slow_speed = round(np.percentile(minor_speeds, 25), 2)
+                    fast_speed = round(np.percentile(minor_speeds, 75), 2)
+                    print(f'\nSpeed (25th/50th/75th percentile): {slow_speed}/{median_speed}/{fast_speed} it/s')
+                except KeyboardInterrupt:
+                    print(f'Keyboard interrupt, closing {fname}.')
+                    outfile.close()
+                    raise
+                except Exception as e:
+                    #print('Error:', e)
+                    median_speed = slow_speed = fast_speed = '-1 (failed)'
+                    print(f'FAILED')
+                
+                outfile.write(f'{desc},{B},{C},{R},{G},{C//G},{slow_speed},{median_speed},{fast_speed}\n')
             print()
+        print(f'All tests done, closing {fname}.')
         outfile.close()

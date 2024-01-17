@@ -25,7 +25,6 @@ NH_compute_stats_pt1(
         f = factor of channels that each thread have to process separately
         d = num. spatial elements (from HW dimension) each thread-block processes in parallel
         Cd = TPB (threads per block)
-        f * TPB = C
        X shape: (N, H, W, C) -view-> (N, H, W/d, d, f, C); X stride: (HWC, WC, dC, C, C, 1)
        shmem reduction: (d, C) -view-> (d, G, D) -permute-> (d, D, G) -reduce-> G
        output buffer: (N, H, 1, G)
@@ -94,7 +93,6 @@ NH_compute_stats_pt1(
     out_idx += blockIdx.z * gf; // dim 2, G/f stride
     out_idx += threadIdx.x; // dim 3, 1 stride
     welford_data[out_idx] = vals_reduced[tid];
-    //welford_data[blockIdx.x * H * G + blockIdx.y * G + threadIdx.x] = vals_reduced[threadIdx.x];
   }
 }
 
@@ -133,10 +131,8 @@ NH_compute_stats_pt2(
     reduce_idx += blockIdx.x * H * G; // dim 0, stride HG
     reduce_idx += i * d * G; // dim 1, stride dG
     reduce_idx += threadIdx.y * G; // dim 2, stride G
-    //reduce_idx += threadIdx.x; // dim 3, stride 1
     reduce_idx += blockIdx.y * gf; // dim 3, stride G/f (if f = 1, this adds nothing)
     reduce_idx += threadIdx.x; // dim 4, stride 1
-    //WelfordType x = welford_data[blockIdx.x * H * G + i * THREADS_PER_BLOCK + tid];
     WelfordType x = welford_data[reduce_idx];
     val = welford_op.combine(val, x);
   }
@@ -161,11 +157,8 @@ NH_compute_stats_pt2(
     thrust::tie(m2, m1) = welford_op.project(vals_reduced[tid]);
     int out_idx = 0;
     out_idx += blockIdx.x * G; // dim 0, G stride
-    //out_idx += threadIdx.x; // dim 1, 1 stride
     out_idx += blockIdx.y * gf; // dim 1, G/f stride
     out_idx += threadIdx.x; // dim 2, 1 stride
-    //means[blockIdx.x * G + threadIdx.x] = m1;
-    //rstds[blockIdx.x * G + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
     means[out_idx] = m1;
     rstds[out_idx] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
   }
