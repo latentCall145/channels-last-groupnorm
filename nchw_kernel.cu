@@ -136,6 +136,7 @@ __global__ void Compute1dBackwardFusedParamsCUDAKernelF(
     const T_ACC x = (sum2 * static_cast<T_ACC>(mean[ng]) - sum1) *
         static_cast<T_ACC>(rstd[ng]) * static_cast<T_ACC>(rstd[ng]) *
         static_cast<T_ACC>(rstd[ng]) * s;
+    //printf("\n\nng: %d, x: %f\n\n", (int)ng, x);
     c2[ng] = x;
     c3[ng] = -x * static_cast<T_ACC>(mean[ng]) -
         sum2 * static_cast<T_ACC>(rstd[ng]) * s;
@@ -711,6 +712,11 @@ void GroupNorm1dBackward(
             gamma_data,
             c2_data,
             c3_data);
+    //std::cout << "mean: " << mean << '\n';
+    //std::cout << "rstd: " << rstd << '\n';
+    //std::cout << "g: " << gamma << '\n';
+    //std::cout << "c2: " << c2 << '\n';
+    //std::cout << "c3: " << c3 << '\n';
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     if (gamma.defined()) {

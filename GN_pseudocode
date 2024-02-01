@@ -1,8 +1,8 @@
 FORWARD
 T (threads per block) = 128 (or 256)
-X = NHWC input -> N(HWd)gG where gG = T, dg = D
-  strides: (HWD)G, gG, G, 1
-N blocks, (x=G, y=g) threads per block
+X = NHWC input -> N(HWd)gC where gC = T, dg = D
+  strides: HWC, gC, C, 1
+N blocks, (x=C, y=g) threads per block
 each block processes one sample in the batch
 each thread processes HWd elements for one group
 
@@ -11,7 +11,7 @@ means, rstds = empty(N, 1, G)
 # get stats
 val = empty
 for i in range(HWd)
-  x = load X[bix*HWDG + i*gG + ty*G + tx]
+  x = load X[bix*HWC + i*gG + ty*G + tx]
   online_welford_reduce(val, x)
 mean, rstd = get_stats(val)
 
@@ -45,13 +45,15 @@ BACKWARD (NCHW)
 G = num groups
 D = dim per group
 n = blockIdx.x # element idx
-g = blockIdx.y # group idx
+#g = blockIdx.y # group idx
+c = threadIdx.x # channel idx
+g = c / D # group idx
+gamma_v = 1 if gamma is None else gamma[c]
+d = c % D # channel idx
 ng = n * G + g # [bix][biy], element-group idx
 sum1 = sum2 = 0
 for (i = tx; i < D; i += bdx)
   index = ng * D + i # [bix][biy][tx]
-  c = g * D + i # [biy][tx]
-  gamma_v = 1 if gamma is None else gamma[c]
   sum1 += dY[index] * X[index] * gamma_v # sum1 = gamma*X @ dY AKA sum(X * (gamma @ dy))
   sum2 += dY[index] * gamma_v # sum2 = gamma @ dY
  

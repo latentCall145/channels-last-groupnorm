@@ -12,12 +12,12 @@
 template <typename T>
 __global__ void
 NH_compute_stats_pt1(
-        const T* X,
-        const int H,
-        const int W,
-        const int C,
-        const int G,
-        at::native::WelfordData<at::acc_type<T, true>, int> *welford_data
+    const T* X,
+    const int H,
+    const int W,
+    const int C,
+    const int G,
+    at::native::WelfordData<at::acc_type<T, true>, int> *welford_data
   ) {
   /*
      C <= MAX_THREADS_PER_BLOCK (Kernel 1):
@@ -99,12 +99,12 @@ NH_compute_stats_pt1(
 template <typename T>
 __global__ void
 NH_compute_stats_pt2(
-        at::native::WelfordData<at::acc_type<T, true>, int> *welford_data,
-        const int H,
-        const int G,
-        const float eps,
-        T* means,
-        T* rstds
+    at::native::WelfordData<at::acc_type<T, true>, int> *welford_data,
+    const int H,
+    const int G,
+    const float eps,
+    T* means,
+    T* rstds
   ) {
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = at::native::WelfordData<T_ACC, int>;
