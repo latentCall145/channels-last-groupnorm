@@ -27,7 +27,7 @@ NH_compute_stats_pt1(
         Cd = TPB (threads per block)
        X shape: (N, H, W, C) -view-> (N, H, W/d, d, f, C); X stride: (HWC, WC, dC, C, C, 1)
        shmem reduction: (d, C) -view-> (d, G, D) -permute-> (d, D, G) -reduce-> G
-       output buffer: (N, H, 1, G)
+       output buffer: (N, 1, G, H)
      C > MAX_THREADS_PER_BLOCK (Kernel 2):
        griddim: (x=N, y=H, z=f); blockdim: (x=TPB, y=d=1)
         f = factor of channels that each thread have to process separately
@@ -35,7 +35,7 @@ NH_compute_stats_pt1(
         f * TPB = C
        X shape: (N, H, W, C) -view-> (N, H, W/d, d, f, TPB); X stride: (HWC, WC, dC, C, TPB, 1)
        shmem reduction: (TPB,) -view-> (1, G/f, D) -permute-> (1, D, G/f) -reduce-> G/f
-       output buffer: (N, H, f, G/f)
+       output buffer: (N, f, G/f, H)
   */
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = at::native::WelfordData<T_ACC, int>;
@@ -88,10 +88,15 @@ NH_compute_stats_pt1(
   // put reduced outputs into return buffers
   if (tid < gf) {
     int out_idx = 0;
-    out_idx += blockIdx.x * H * G; // dim 0, HG stride
-    out_idx += blockIdx.y * G; // dim 1, G stride
-    out_idx += blockIdx.z * gf; // dim 2, G/f stride
-    out_idx += threadIdx.x; // dim 3, 1 stride
+    //out_idx += blockIdx.x * H * G; // dim 0, HG stride
+    //out_idx += blockIdx.y * G; // dim 1, G stride
+    //out_idx += blockIdx.z * gf; // dim 2, G/f stride
+    //out_idx += threadIdx.x; // dim 3, 1 stride
+
+    out_idx += blockIdx.x * G * H; // dim 0, HG stride
+    out_idx += blockIdx.z * gf * H; // dim 2, G/f stride
+    out_idx += threadIdx.x * H; // dim 3, 1 stride
+    out_idx += blockIdx.y; // dim 1, G stride
     welford_data[out_idx] = vals_reduced[tid];
   }
 }
@@ -164,6 +169,59 @@ NH_compute_stats_pt2(
   }
 }
 
+
+template <typename T>
+__global__ void
+NH_compute_stats_pt2B(
+    at::native::WelfordData<at::acc_type<T, true>, int> *welford_data,
+    const int H,
+    const int G,
+    const float eps,
+    T* means,
+    T* rstds
+  ) {
+  using T_ACC = at::acc_type<T, true>;
+  using WelfordType = at::native::WelfordData<T_ACC, int>;
+  using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  /*
+     griddim: (x=N, y=G); blockdim: (x=H)
+      d = num. spatial elements (from H dimension) each thread-block processes in parallel
+      Gd/f = TPB (threads per block)
+     welford_data shape: (N, G, H); X stride: (GH, H, 1)
+     shmem reduction: (H) -reduce-> 1
+     output buffer: (N, G)
+  */
+
+  WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
+  WelfordType val(0, 0, 0, 0);
+  const int TPB = blockDim.y * blockDim.x;
+
+  // shmem reduction
+  __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[MAX_THREADS_PER_BLOCK];
+  WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
+
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+  vals_reduced[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
+  __syncthreads();
+
+  for (int stride = TPB / 2; stride >= 1; stride >>= 1) {
+    if (tid < stride)
+      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
+    __syncthreads();
+    }
+
+  // put reduced outputs into return buffers
+  if (tid < 1) {
+    T_ACC m1, m2;
+    thrust::tie(m2, m1) = welford_op.project(vals_reduced[tid]);
+    int out_idx = 0;
+    out_idx += blockIdx.x * G; // dim 0, G stride
+    out_idx += blockIdx.y; // dim 1, G/f stride
+    means[out_idx] = m1;
+    rstds[out_idx] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
+  }
+}
+
 template <typename T>
 void NH_gn_fwd(
     const torch::Tensor& X,
@@ -184,7 +242,8 @@ void NH_gn_fwd(
   const int C = X.size(3);
 
   using WelfordType = at::native::WelfordData<at::acc_type<T, true>, int>;
-  torch::Tensor welford_tensor = torch::empty({N, H, G, sizeof(WelfordType)}, X.options().dtype(torch::kByte));
+  //torch::Tensor welford_tensor = torch::empty({N, H, G, sizeof(WelfordType)}, X.options().dtype(torch::kByte));
+  torch::Tensor welford_tensor = torch::empty({N, G, H, sizeof(WelfordType)}, X.options().dtype(torch::kByte));
   WelfordType *welford_data = reinterpret_cast<WelfordType *>(welford_tensor.mutable_data_ptr());
   
   int blockDimX, blockDimY, f, TPB;
@@ -197,10 +256,19 @@ void NH_gn_fwd(
       welford_data
   );
 
+  //TPB = MIN(MAX_THREADS_PER_BLOCK, H * G / f);
+  //blockDimX = MIN(TPB, G / f);
+  //blockDimY = TPB / blockDimX;
+  //NH_compute_stats_pt2<<<dim3(N, f), dim3(blockDimX, blockDimY)>>>(
+  //        welford_data,
+  //        H, G, eps,
+  //        mean_data, rstd_data
+  //  );
+
   TPB = MIN(MAX_THREADS_PER_BLOCK, H * G / f);
   blockDimX = MIN(TPB, G / f);
   blockDimY = TPB / blockDimX;
-  NH_compute_stats_pt2<<<dim3(N, f), dim3(blockDimX, blockDimY)>>>(
+  NH_compute_stats_pt2B<<<dim3(N, G), H>>>(
           welford_data,
           H, G, eps,
           mean_data, rstd_data

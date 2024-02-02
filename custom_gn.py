@@ -106,16 +106,18 @@ class GN_NCHW(nn.GroupNorm):
             return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
 
 if __name__ == '__main__':
+    DTYPE = torch.float
+    DTYPE = torch.double
     DTYPE = torch.bfloat16
     print('DTYPE:', DTYPE)
-    MODE = 'check' # can be 'check', 'bench', other modes do both
+    MODE = 'bench' # can be 'check', 'bench', other modes do both
 
     if MODE != 'bench':
         B = 2
-        #C = 64
-        #R = 256
-        C = 128
-        R = 64
+        C = 64
+        R = 256
+        #C = 128
+        #R = 64
         G = 32
         #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
         x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
@@ -125,44 +127,42 @@ if __name__ == '__main__':
         gn1 = GN_NCHW(G, C).cuda().to(DTYPE)
         gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
 
-        #with torch.no_grad():
-        #    w = torch.randn((C,))
-        #    b = torch.randn((C,))
-        #    gn1.weight.copy_(w)
-        #    gn1.bias.copy_(b)
-        #    gn2.weight.copy_(w)
-        #    gn2.bias.copy_(b)
+        with torch.no_grad():
+            w = torch.randn((C,))
+            b = torch.randn((C,))
+            gn1.weight.copy_(w)
+            gn1.bias.copy_(b)
+            gn2.weight.copy_(w)
+            gn2.bias.copy_(b)
         g1 = gn1(x.contiguous())
         g2 = gn2(x)
+        #g1sum = g1.sum()
+        #g2sum = g2.sum()
         rand_dy = torch.rand_like(g2)
-        rand_dy = torch.ones_like(g1)
-        #g1sum = (g1 * rand_dy).sum()
-        #g2sum = (g2 * rand_dy).sum()
-        g1sum = g1.sum()
-        g2sum = g2.sum()
-        print('FORWARD')
-        print('g2', g1.shape)
-        #print(g1-g2)
+        g1sum = (g1 * rand_dy).sum()
+        g2sum = (g2 * rand_dy).sum()
 
-        print('BACKWARD')
-        print('g1 sum wrt w')
         g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0].reshape((gn1.weight.numel(),))
         g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0].reshape((gn1.weight.numel(),))
-        #print(g1_grad_wrt_w - g2_grad_wrt_w)
 
-        #print('g1 sum wrt b')
-        #g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
-        #g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
-        #print(g1_grad_wrt_b - g2_grad_wrt_b)
+        g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
+        g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
 
-        #print('g1 sum wrt x')
-        #g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-        #g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-        #print(g1_grad_wrt_x-g2_grad_wrt_x)
+        g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+        g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+
+        print('FORWARD')
+        print(g1 - g2)
+        print('BACKWARD')
+        print('g1 sum wrt w')
+        print(g1_grad_wrt_w - g2_grad_wrt_w)
+        print('g1 sum wrt b')
+        print(g1_grad_wrt_b - g2_grad_wrt_b)
+        print('g1 sum wrt x')
+        print(g1_grad_wrt_x-g2_grad_wrt_x)
 
     if MODE != 'check':
         NSEC = 5 # number of seconds that each kernel runs for on a certain input
-        TRIALS = 1 # number of seconds that each kernel runs for on a certain input
         BATCHES = [1, 2, 4, 8, 16, 32]
         CHANNELS = [32, 64, 128, 256, 512]
         RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
@@ -196,8 +196,8 @@ if __name__ == '__main__':
                     #(16, 64, 256, 16),
                     #(32, 64, 256, 16),
 
-                    (1, 128, 32, 16),
-                    (2, 128, 32, 16),
+                    #(1, 128, 64, 16),
+                    (2, 128, 64, 16),
                     #(4, 128, 32, 16),
                     #(8, 128, 32, 16),
                     #(16, 128, 32, 16),
@@ -218,7 +218,7 @@ if __name__ == '__main__':
             x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
 
             gn_args = (G, C)
-            BENCH = 'bwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
+            BENCH = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
             print(BENCH, 'X shape:', x_nchw.shape, 'G (num groups):', G)
             for gn_class, desc, fwd_fn in GN_KERNELS:
                 gn_input = x_nchw if 'NCHW' in desc else x_nhwc
