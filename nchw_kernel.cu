@@ -858,6 +858,8 @@ void GroupNormBackwardKernelImplInternal(
   ComputeInternalGradientsCUDAKernelF<T><<<N * C, num_threads, 0, cuda_stream>>>(
       HxW, dY_data, X_data, ds_data, db_data);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  //std::cout << "ds: " << ds << '\n';
+  //std::cout << "db: " << db << '\n';
 
   if (dX.defined()) {
     torch::Tensor c1 = at::empty({0}, X.options().dtype(kAccType));
