@@ -21,7 +21,11 @@ gn_op = load(
             '--extended-lambda', # necessary flag to use gpu_kernel in CUDA kernels
             '-lineinfo', # useful for profiling
             ],
-        extra_cflags=['-O3'], # needed or else GN NCHW from source is slower than nn.GroupNorm
+        extra_cflags=[
+            '-O3', # needed or else GN NCHW from source is slower than nn.GroupNorm
+            '-funroll-all-loops',
+            '-march=native',
+            ], 
         verbose=True
         )
 
@@ -102,14 +106,16 @@ class GN_NCHW(nn.GroupNorm):
             return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
 
 if __name__ == '__main__':
-    DTYPE = torch.float
+    DTYPE = torch.bfloat16
     print('DTYPE:', DTYPE)
-    MODE = 'bench' # can be 'check', 'bench', other modes do both
+    MODE = 'check' # can be 'check', 'bench', other modes do both
 
     if MODE != 'bench':
-        B = 8
-        C = 64
-        R = 256
+        B = 2
+        #C = 64
+        #R = 256
+        C = 128
+        R = 64
         G = 32
         #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
         x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
@@ -183,12 +189,19 @@ if __name__ == '__main__':
                 return False
 
             return (B, C, R, G) in {
-                    (1, 64, 256, 16),
-                    (2, 64, 256, 16),
-                    (4, 64, 256, 16),
-                    (8, 64, 256, 16),
-                    (16, 64, 256, 16),
-                    (32, 64, 256, 16),
+                    #(1, 64, 256, 16),
+                    #(2, 64, 256, 16),
+                    #(4, 64, 256, 16),
+                    #(8, 64, 256, 16),
+                    #(16, 64, 256, 16),
+                    #(32, 64, 256, 16),
+
+                    (1, 128, 32, 16),
+                    (2, 128, 32, 16),
+                    #(4, 128, 32, 16),
+                    #(8, 128, 32, 16),
+                    #(16, 128, 32, 16),
+                    #(32, 128, 32, 16),
                     }
 
             dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
