@@ -9,10 +9,10 @@ gn_op = load(
         name="gn_op",
         sources=[
             os.path.join(module_dir, "custom_gn.cpp"),
-            os.path.join(module_dir, "N_grid_gn_kernel.cu"),
+            #os.path.join(module_dir, "N_grid_gn_kernel.cu"),
             os.path.join(module_dir, "NH_grid_gn_kernel.cu"),
-            os.path.join(module_dir, "NG_grid_gn_kernel.cu"),
-            os.path.join(module_dir, "fully_fused_gn_kernel.cu"),
+            #os.path.join(module_dir, "NG_grid_gn_kernel.cu"),
+            #os.path.join(module_dir, "fully_fused_gn_kernel.cu"),
             os.path.join(module_dir, "bwd_gn_kernel.cu"),
             os.path.join(module_dir, "nchw_kernel.cu")
             ],
@@ -136,14 +136,14 @@ if __name__ == '__main__':
         #    gn2.bias.copy_(b)
         g1 = gn1(x.contiguous())
         g2 = gn2(x)
-        g1sum = g1.sum()
-        g2sum = g2.sum()
+        #g1sum = g1.sum()
+        #g2sum = g2.sum()
         #rand_dy = torch.rand_like(g2)
         #g1sum = (g1 * rand_dy).sum()
         #g2sum = (g2 * rand_dy).sum()
 
-        g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
-        g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
+        #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
+        #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
         #g1_grad_wrt_w = g1_grad_wrt_w.reshape((gn1.weight.numel(),))
         #g2_grad_wrt_w = g2_grad_wrt_w.reshape((gn2.weight.numel(),))
 
@@ -153,8 +153,8 @@ if __name__ == '__main__':
         #g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
         #g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
 
-        #print('FORWARD')
-        #print(g1 - g2)
+        print('FORWARD')
+        print(g1 - g2)
         #print('BACKWARD')
         #print('g1 sum wrt w')
         #print(g1_grad_wrt_w - g2_grad_wrt_w)
