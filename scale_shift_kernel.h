@@ -1,8 +1,11 @@
+#pragma once 
 #ifndef SCALE_SHIFT_KERNEL
 #define SCALE_SHIFT_KERNEL
-#include <torch/torch.h> // torch tensor
 #include <ATen/native/cuda/Loops.cuh> // gpu kernel
 #include <ATen/AccumulateType.h> // acc_type
+#include <ATen/ops/empty.h>
+#include <ATen/Tensor.h> // torch tensor
+#include <c10/cuda/CUDAMathCompat.h> // rsqrt
 
 template <typename T>
 __global__ void
@@ -58,13 +61,13 @@ T inline gelu_tanh(T x) {
 // note: when fn body is modified, must recompile all modules that call this fn so they can adopt the change (since headers aren't compiled)
 template <typename T>
 void scale_shift(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
-    torch::Tensor& Y,
-    torch::Tensor& means,
-    torch::Tensor& rstds) {
+    at::Tensor& Y,
+    at::Tensor& means,
+    at::Tensor& rstds) {
   using T_ACC = at::acc_type<T, true>;
   const T* X_data = X.const_data_ptr<T>();
   T* mean_data = means.mutable_data_ptr<T>();
@@ -85,8 +88,8 @@ void scale_shift(
         ? at::kFloat
         : X.scalar_type();
 
-    torch::Tensor a = torch::empty({N, C}, X.options().dtype(kAccType));
-    torch::Tensor b = torch::empty({N, C}, X.options().dtype(kAccType));
+    at::Tensor a = at::empty({N, C}, X.options().dtype(kAccType));
+    at::Tensor b = at::empty({N, C}, X.options().dtype(kAccType));
     T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
     T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
 
