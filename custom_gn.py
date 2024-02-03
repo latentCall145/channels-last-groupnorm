@@ -106,11 +106,11 @@ class GN_NCHW(nn.GroupNorm):
             return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
 
 if __name__ == '__main__':
-    DTYPE = torch.float
     DTYPE = torch.double
+    DTYPE = torch.float
     DTYPE = torch.bfloat16
     print('DTYPE:', DTYPE)
-    MODE = 'bench' # can be 'check', 'bench', other modes do both
+    MODE = 'check' # can be 'check', 'bench', other modes do both
 
     if MODE != 'bench':
         B = 2
@@ -127,39 +127,41 @@ if __name__ == '__main__':
         gn1 = GN_NCHW(G, C).cuda().to(DTYPE)
         gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
 
-        with torch.no_grad():
-            w = torch.randn((C,))
-            b = torch.randn((C,))
-            gn1.weight.copy_(w)
-            gn1.bias.copy_(b)
-            gn2.weight.copy_(w)
-            gn2.bias.copy_(b)
+        #with torch.no_grad():
+        #    w = torch.randn((C,))
+        #    b = torch.randn((C,))
+        #    gn1.weight.copy_(w)
+        #    gn1.bias.copy_(b)
+        #    gn2.weight.copy_(w)
+        #    gn2.bias.copy_(b)
         g1 = gn1(x.contiguous())
         g2 = gn2(x)
-        #g1sum = g1.sum()
-        #g2sum = g2.sum()
-        rand_dy = torch.rand_like(g2)
-        g1sum = (g1 * rand_dy).sum()
-        g2sum = (g2 * rand_dy).sum()
+        g1sum = g1.sum()
+        g2sum = g2.sum()
+        #rand_dy = torch.rand_like(g2)
+        #g1sum = (g1 * rand_dy).sum()
+        #g2sum = (g2 * rand_dy).sum()
 
-        g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0].reshape((gn1.weight.numel(),))
-        g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0].reshape((gn1.weight.numel(),))
+        g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
+        g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
+        #g1_grad_wrt_w = g1_grad_wrt_w.reshape((gn1.weight.numel(),))
+        #g2_grad_wrt_w = g2_grad_wrt_w.reshape((gn2.weight.numel(),))
 
-        g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
-        g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
+        #g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
+        #g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
 
-        g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-        g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+        #g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+        #g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
 
-        print('FORWARD')
-        print(g1 - g2)
-        print('BACKWARD')
-        print('g1 sum wrt w')
-        print(g1_grad_wrt_w - g2_grad_wrt_w)
-        print('g1 sum wrt b')
-        print(g1_grad_wrt_b - g2_grad_wrt_b)
-        print('g1 sum wrt x')
-        print(g1_grad_wrt_x-g2_grad_wrt_x)
+        #print('FORWARD')
+        #print(g1 - g2)
+        #print('BACKWARD')
+        #print('g1 sum wrt w')
+        #print(g1_grad_wrt_w - g2_grad_wrt_w)
+        #print('g1 sum wrt b')
+        #print(g1_grad_wrt_b - g2_grad_wrt_b)
+        #print('g1 sum wrt x')
+        #print(g1_grad_wrt_x-g2_grad_wrt_x)
 
     if MODE != 'check':
         NSEC = 5 # number of seconds that each kernel runs for on a certain input

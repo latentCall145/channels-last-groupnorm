@@ -1,75 +1,77 @@
 #include <torch/extension.h>
-#include <torch/torch.h>
+#include <ATen/ops/empty_like.h>
+#include <ATen/ops/empty.h>
+#include <ATen/Tensor.h>
 
 void GroupNormKernelImpl(
-    const torch::Tensor& X,
-    const torch::Tensor& gamma,
-    const torch::Tensor& beta,
+    const at::Tensor& X,
+    const at::Tensor& gamma,
+    const at::Tensor& beta,
     int64_t N,
     int64_t C,
     int64_t HxW,
     int64_t group,
     double eps,
-    torch::Tensor& Y,
-    torch::Tensor& mean,
-    torch::Tensor& rstd);
+    at::Tensor& Y,
+    at::Tensor& mean,
+    at::Tensor& rstd);
 
 void GroupNormBackwardKernelImpl(
-    const torch::Tensor& dY,
-    const torch::Tensor& X,
-    const torch::Tensor& mean,
-    const torch::Tensor& rstd,
-    const torch::Tensor& gamma,
+    const at::Tensor& dY,
+    const at::Tensor& X,
+    const at::Tensor& mean,
+    const at::Tensor& rstd,
+    const at::Tensor& gamma,
     int64_t N,
     int64_t C,
     int64_t HxW,
     int64_t group,
-    torch::Tensor& dX,
-    torch::Tensor& dgamma,
-    torch::Tensor& dbeta);
+    at::Tensor& dX,
+    at::Tensor& dgamma,
+    at::Tensor& dbeta);
 
-std::vector<torch::Tensor> gn_nhwc_cuda_fwd_N_grid(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+std::vector<at::Tensor> gn_nhwc_cuda_fwd_N_grid(
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
     float eps);
 
-std::vector<torch::Tensor> gn_nhwc_cuda_fwd_NH_grid(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+std::vector<at::Tensor> gn_nhwc_cuda_fwd_NH_grid(
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
     float eps);
 
-std::vector<torch::Tensor> gn_nhwc_cuda_fwd_NG_grid(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+std::vector<at::Tensor> gn_nhwc_cuda_fwd_NG_grid(
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
     float eps);
 
-std::vector<torch::Tensor> gn_nhwc_cuda_fwd_fused(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+std::vector<at::Tensor> gn_nhwc_cuda_fwd_fused(
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
     float eps);
 
-std::vector<torch::Tensor> gn_nhwc_cuda_bwd(
-    const torch::Tensor& dY,
-    const torch::Tensor& X,
-    const torch::Tensor& mean,
-    const torch::Tensor& rstd,
-    const torch::Tensor& gamma,
+std::vector<at::Tensor> gn_nhwc_cuda_bwd(
+    const at::Tensor& dY,
+    const at::Tensor& X,
+    const at::Tensor& mean,
+    const at::Tensor& rstd,
+    const at::Tensor& gamma,
     const int G);
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 
-std::vector<torch::Tensor> gn_nhwc_fwd_N_grid(
-    const torch::Tensor X,
-    const torch::Tensor weight,
-    const torch::Tensor bias,
+std::vector<at::Tensor> gn_nhwc_fwd_N_grid(
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor bias,
     const int G,
     float eps) {
   CHECK_CUDA(X);
@@ -78,10 +80,10 @@ std::vector<torch::Tensor> gn_nhwc_fwd_N_grid(
   return gn_nhwc_cuda_fwd_N_grid(X, weight, bias, G, eps);
 }
 
-std::vector<torch::Tensor> gn_nhwc_fwd_NH_grid(
-    const torch::Tensor X,
-    const torch::Tensor weight,
-    const torch::Tensor bias,
+std::vector<at::Tensor> gn_nhwc_fwd_NH_grid(
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor bias,
     const int G,
     float eps) {
   CHECK_CUDA(X);
@@ -90,10 +92,10 @@ std::vector<torch::Tensor> gn_nhwc_fwd_NH_grid(
   return gn_nhwc_cuda_fwd_NH_grid(X, weight, bias, G, eps);
 }
 
-std::vector<torch::Tensor> gn_nhwc_fwd_NG_grid(
-    const torch::Tensor X,
-    const torch::Tensor weight,
-    const torch::Tensor bias,
+std::vector<at::Tensor> gn_nhwc_fwd_NG_grid(
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor bias,
     const int G,
     float eps) {
   CHECK_CUDA(X);
@@ -102,10 +104,10 @@ std::vector<torch::Tensor> gn_nhwc_fwd_NG_grid(
   return gn_nhwc_cuda_fwd_NG_grid(X, weight, bias, G, eps);
 }
 
-std::vector<torch::Tensor> gn_nhwc_fwd_fused(
-    const torch::Tensor X,
-    const torch::Tensor weight,
-    const torch::Tensor bias,
+std::vector<at::Tensor> gn_nhwc_fwd_fused(
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor bias,
     const int G,
     float eps) {
   CHECK_CUDA(X);
@@ -114,28 +116,28 @@ std::vector<torch::Tensor> gn_nhwc_fwd_fused(
   return gn_nhwc_cuda_fwd_fused(X, weight, bias, G, eps);
 }
 
-std::vector<torch::Tensor> gn_nhwc_bwd(
-    const torch::Tensor dy,
-    const torch::Tensor X,
-    const torch::Tensor weight,
-    const torch::Tensor means,
-    const torch::Tensor rstds,
+std::vector<at::Tensor> gn_nhwc_bwd(
+    const at::Tensor dy,
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor means,
+    const at::Tensor rstds,
     const int G) {
   CHECK_CUDA(dy);
   CHECK_CUDA(X);
   CHECK_CUDA(weight);
   CHECK_CUDA(means);
   CHECK_CUDA(rstds);
-  torch::Tensor dX = torch::empty_like(X);
-  torch::Tensor dgamma = torch::empty_like(weight);
-  torch::Tensor dbeta = torch::empty_like(weight);
+  at::Tensor dX = at::empty_like(X);
+  at::Tensor dgamma = at::empty_like(weight);
+  at::Tensor dbeta = at::empty_like(weight);
   return gn_nhwc_cuda_bwd(dy, X, means, rstds, weight, G);
 }
 
-std::vector<torch::Tensor> gn_nchw_forward(
-    const torch::Tensor X,
-    const torch::Tensor weight,
-    const torch::Tensor bias,
+std::vector<at::Tensor> gn_nchw_forward(
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor bias,
     const int G,
     float eps) {
   CHECK_CUDA(X);
@@ -145,9 +147,9 @@ std::vector<torch::Tensor> gn_nchw_forward(
   const int C = X.size(1);
   const int H = X.size(2);
   const int W = X.size(3);
-  torch::Tensor Y = torch::empty_like(X);
-  torch::Tensor mean = torch::empty({N, G}, X.options());
-  torch::Tensor rstd = torch::empty({N, G}, X.options());
+  at::Tensor Y = at::empty_like(X);
+  at::Tensor mean = at::empty({N, G}, X.options());
+  at::Tensor rstd = at::empty({N, G}, X.options());
   GroupNormKernelImpl(
     X, weight, bias,
     N, C, H * W,
@@ -159,12 +161,12 @@ std::vector<torch::Tensor> gn_nchw_forward(
   return {Y, mean, rstd};
 }
 
-std::vector<torch::Tensor> gn_nchw_backward(
-    const torch::Tensor dy,
-    const torch::Tensor X,
-    const torch::Tensor weight,
-    const torch::Tensor means,
-    const torch::Tensor rstds,
+std::vector<at::Tensor> gn_nchw_backward(
+    const at::Tensor dy,
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor means,
+    const at::Tensor rstds,
     const int G) {
   CHECK_CUDA(dy);
   CHECK_CUDA(X);
@@ -175,9 +177,9 @@ std::vector<torch::Tensor> gn_nchw_backward(
   const int C = X.size(1);
   const int H = X.size(2);
   const int W = X.size(3);
-  torch::Tensor dX = torch::empty_like(X);
-  torch::Tensor dgamma = torch::empty_like(weight);
-  torch::Tensor dbeta = torch::empty_like(weight);
+  at::Tensor dX = at::empty_like(X);
+  at::Tensor dgamma = at::empty_like(weight);
+  at::Tensor dbeta = at::empty_like(weight);
   GroupNormBackwardKernelImpl(
       dy, X,
       means, rstds, weight,

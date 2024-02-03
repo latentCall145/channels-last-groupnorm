@@ -1,13 +1,31 @@
-#include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
+//#include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
 #include <ATen/native/cuda/Loops.cuh> // gpu kernel
 #include <ATen/AccumulateType.h> // acc_type
+#include <ATen/Tensor.h> // at::tensor
+#include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
+#include <ATen/Dispatch.h> // at_dispatch macro
 #include <c10/core/ScalarType.h>
-#include <thrust/pair.h> // thrust::pair
-#include <torch/torch.h> // torch tensor
 #include <vector> // std::vector
 #define MAX_THREADS_PER_BLOCK 512
 #define MAX(a, b) (a > b) ? a : b
 #define MIN(a, b) (a < b) ? a : b
+
+template <typename T>
+__device__ void
+sum_reduce(
+    T vals_reduced,
+    const int start_stride,
+    const int end_stride
+  ) {
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+#pragma unroll 8
+  for (int stride = start_stride; stride >= end_stride; stride >>= 1)
+    if (tid < stride) {
+      vals_reduced[tid] += vals_reduced[tid + stride];
+    __syncthreads();
+    }
+}
 
 template <typename T>
 __global__ void
@@ -40,11 +58,11 @@ spatial_loop(
    */
 
   using T_ACC = at::acc_type<T, true>;
-  T_ACC xdy_sum = 0;
-  T_ACC dy_sum = 0;
   const int TPB = blockDim.y * blockDim.x;
   const int d = blockDim.y;
   const int w = W / d;
+  T_ACC xdy_sum = 0;
+  T_ACC dy_sum = 0;
 
 #pragma unroll 8
   for (int i = 0; i < w; ++i) {
@@ -55,8 +73,9 @@ spatial_loop(
     reduce_idx += threadIdx.y * C; // dim 3, C stride
     reduce_idx += blockIdx.z * TPB; // dim 4, TPB stride (in kernel 1, threadIdx.z is always 0 so this statement does nothing)
     reduce_idx += threadIdx.x; // dim 5, 1 stride
-    xdy_sum += static_cast<T_ACC>(dy_data[reduce_idx]) * static_cast<T_ACC>(X_data[reduce_idx]);
-    dy_sum += static_cast<T_ACC>(dy_data[reduce_idx]);
+    T_ACC dy_elem = static_cast<T_ACC>(dy_data[reduce_idx]);
+    xdy_sum += dy_elem * X_data[reduce_idx];
+    dy_sum += dy_elem;
   }
 
   // shmem reduction
@@ -67,14 +86,7 @@ spatial_loop(
   vals_reduced[2 * tid] = xdy_sum;
   vals_reduced[2 * tid + 1] = dy_sum;
   __syncthreads();
-
-#pragma unroll 8
-  for (int stride = TPB; stride >= 2 * C; stride >>= 1) { // stopping at 2 * C (instead of just C) since we are reducing 2*C values
-    if (tid < stride) {
-      vals_reduced[tid] += vals_reduced[tid + stride];
-    __syncthreads();
-    }
-  }
+  sum_reduce(vals_reduced, TPB, 2 * C);
 
   // put reduced outputs into return buffers
   if (tid < C) {
@@ -101,6 +113,7 @@ compute_bwd_scale_biases(
     const int W,
     const int C,
     const int G,
+    at::acc_type<T, true>* coef1_data,
     at::acc_type<T, true>* coef2_data,
     at::acc_type<T, true>* coef3_data) {
   /*
@@ -117,39 +130,32 @@ compute_bwd_scale_biases(
   const int c = threadIdx.x;
   const int g = c / D;
   const int d = c % D;
+  const int nc = n * C + c;
   const T_ACC gamma_v = static_cast<T_ACC>(weight_data[c]);
 
   extern __shared__ char vals_reduced_uncasted[]; // size 2*C, C for sum1, C for sum2
   T_ACC *vals_reduced = reinterpret_cast<T_ACC*>(vals_reduced_uncasted);
 
-  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  const int nc = n * C + c;
   int idx = 0;
   idx += d * G;
   idx += g;
   vals_reduced[2 * idx] = xdy_sum_data[nc] * gamma_v;
   vals_reduced[2 * idx + 1] = dy_sum_data[nc] * gamma_v;
   __syncthreads();
+  sum_reduce(vals_reduced, C, 2 * G);
 
-#pragma unroll 8
-  for (int stride = C; stride >= 2 * G; stride >>= 1) {
-    if (tid < stride) {
-      vals_reduced[tid] += vals_reduced[tid + stride];
-    __syncthreads();
-    }
-  }
+  const int ng = n * G + g;
+  const T_ACC mean_elem = static_cast<T_ACC>(mean_data[ng]);
+  const T_ACC rstd_elem = static_cast<T_ACC>(rstd_data[ng]);
+  coef1_data[nc] = rstd_elem * weight_data[c];
 
-  if (tid < G) {
-    const int ng = n * G + tid;
-    const T_ACC sum1 = vals_reduced[2 * tid];
-    const T_ACC sum2 = vals_reduced[2 * tid + 1];
+  if (d == 0) {
+    const T_ACC sum1 = vals_reduced[2 * g];
+    const T_ACC sum2 = vals_reduced[2 * g + 1];
     const T_ACC s = T_ACC(1) / static_cast<T_ACC>(D * H * W);
-    const T_ACC x = (sum2 * static_cast<T_ACC>(mean_data[ng]) - sum1) *
-        static_cast<T_ACC>(rstd_data[ng]) * static_cast<T_ACC>(rstd_data[ng]) *
-        static_cast<T_ACC>(rstd_data[ng]) * s;
+    const T_ACC x = (sum2 * mean_elem - sum1) * (rstd_elem * rstd_elem * rstd_elem * s);
     coef2_data[ng] = x;
-    coef3_data[ng] = -x * static_cast<T_ACC>(mean_data[ng]) -
-      sum2 * static_cast<T_ACC>(rstd_data[ng]) * s;
+    coef3_data[ng] = (-x * mean_elem) - (sum2 * rstd_elem * s);
   }
 }
 
@@ -185,16 +191,16 @@ compute_dweight_dbias(
 }
 
 template <typename T>
-void gn_bwd(
-      const torch::Tensor& dy_nhwc,
-      const torch::Tensor& X_nhwc,
-      const torch::Tensor& weight,
-      const torch::Tensor& mean,
-      const torch::Tensor& rstd,
+void run_gn_bwd_kernels(
+      const at::Tensor& dy_nhwc,
+      const at::Tensor& X_nhwc,
+      const at::Tensor& weight,
+      const at::Tensor& mean,
+      const at::Tensor& rstd,
       const int G,
-      torch::Tensor& dX,
-      torch::Tensor& dweight,
-      torch::Tensor& dbias
+      at::Tensor& dX,
+      at::Tensor& dweight,
+      at::Tensor& dbias
   ) {
   using T_ACC = at::acc_type<T, true>;
   const int N = X_nhwc.size(0);
@@ -209,33 +215,26 @@ void gn_bwd(
   const T* rstd_data = rstd.const_data_ptr<T>();
   const T* weight_data = weight.const_data_ptr<T>();
 
-  const auto kAccType =
-      (X_nhwc.scalar_type() == at::kHalf || X_nhwc.scalar_type() == at::kBFloat16)
+  const c10::ScalarType kAccType =
+      (X_nhwc.scalar_type() == c10::ScalarType::Half || X_nhwc.scalar_type() == c10::ScalarType::BFloat16)
       ? at::kFloat
       : X_nhwc.scalar_type();
 
+  at::Tensor xdy_dy_sum = at::empty({2, N, C, H}, X_nhwc.options().dtype(kAccType));
+  T_ACC* xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
+  T_ACC* dy_sum_data = xdy_sum_data + N * C * H;
   const int TPB = MIN(MAX_THREADS_PER_BLOCK, H * W * C);
   const int blockDimX = MIN(TPB, C);
   const int blockDimY = TPB / blockDimX;
   const int f = MAX(C / TPB, 1); // note: impossible for f > 1 AND blockDimY > 1
-  torch::Tensor xdy_sum = at::empty({N, C, H}, X_nhwc.options().dtype(kAccType));
-  torch::Tensor dy_sum = at::empty({N, C, H}, X_nhwc.options().dtype(kAccType));
-  T_ACC* xdy_sum_data = xdy_sum.mutable_data_ptr<T_ACC>();
-  T_ACC* dy_sum_data = dy_sum.mutable_data_ptr<T_ACC>();
-
-  dim3 dimGrid(N, H, f);
-  dim3 dimBlock(blockDimX, blockDimY);
-  spatial_loop<<<dimGrid, dimBlock, sizeof(T_ACC) * 2 * TPB>>>(
+  spatial_loop<<<dim3(N, H, f), dim3(blockDimX, blockDimY), sizeof(T_ACC) * 2 * TPB>>>(
       dy_data, X_data, 
       H, W, C,
       xdy_sum_data, dy_sum_data);
-
   // sum over H dimension
-  xdy_sum = xdy_sum.sum(2);
-  dy_sum = dy_sum.sum(2);
-
-  xdy_sum_data = xdy_sum.mutable_data_ptr<T_ACC>();
-  dy_sum_data = dy_sum.mutable_data_ptr<T_ACC>();
+  xdy_dy_sum = xdy_dy_sum.sum(3); // xdy_dy_sum shape now (2, N, C)
+  xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
+  dy_sum_data = xdy_sum_data + N * C;
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   T* dweight_data = dweight.mutable_data_ptr<T>();
@@ -245,32 +244,22 @@ void gn_bwd(
       xdy_sum_data, dy_sum_data,
       N, C, G,
       dweight_data, dbias_data);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  torch::Tensor coef1 = at::empty({N, G, D}, X_nhwc.options().dtype(kAccType));
-  torch::Tensor coef2 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
-  torch::Tensor coef3 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
+  at::Tensor coef1 = at::empty({N, C}, X_nhwc.options().dtype(kAccType));
+  at::Tensor coef2 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
+  at::Tensor coef3 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
+  T_ACC* coef1_data = coef1.mutable_data_ptr<T_ACC>();
   T_ACC* coef2_data = coef2.mutable_data_ptr<T_ACC>();
   T_ACC* coef3_data = coef3.mutable_data_ptr<T_ACC>();
-
-  at::TensorIterator iter = at::TensorIteratorConfig()
-                  .check_all_same_dtype(std::is_same<T, T_ACC>::value)
-                  .add_output(coef1)
-                  .add_owned_input(rstd.view({N, G, 1}))
-                  .add_owned_input(weight.view({1, G, D}))
-                  .build();
-  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T rstd, T weight) -> T_ACC {
-    return static_cast<T_ACC>(rstd) * static_cast<T_ACC>(weight);
-  });
-
   compute_bwd_scale_biases<<<N, C, sizeof(T_ACC) * 2 * C>>>(
       mean_data, rstd_data, weight_data,
       xdy_sum_data, dy_sum_data,
       H, W, C, G,
-      coef2_data, coef3_data);
-
+      coef1_data, coef2_data, coef3_data);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  iter = at::TensorIteratorConfig()
+  at::TensorIterator iter = at::TensorIteratorConfig()
                   .check_all_same_dtype(std::is_same<T, T_ACC>::value)
                   .resize_outputs(false)
                   .add_owned_output(dX.view({N, H * W, G, D}))
@@ -282,33 +271,32 @@ void gn_bwd(
                   .build();
   at::native::gpu_kernel(
       iter, [] GPU_LAMBDA(T dy, T x, T_ACC coef1, T_ACC coef2, T_ACC coef3) -> T {
-        return coef1 * static_cast<T_ACC>(dy) + coef2 * static_cast<T_ACC>(x) + 
-                coef3;
+        return (coef1 * static_cast<T_ACC>(dy)) + (coef2 * static_cast<T_ACC>(x)) + coef3;
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-std::vector<torch::Tensor> gn_nhwc_cuda_bwd(
-    const torch::Tensor& dy,
-    const torch::Tensor& X,
-    const torch::Tensor& mean,
-    const torch::Tensor& rstd,
-    const torch::Tensor& weight,
+std::vector<at::Tensor> gn_nhwc_cuda_bwd(
+    const at::Tensor& dy,
+    const at::Tensor& X,
+    const at::Tensor& mean,
+    const at::Tensor& rstd,
+    const at::Tensor& weight,
     const int G
   ) {
   const int C = X.size(1);
-  torch::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
-  torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
-  torch::Tensor dX = torch::empty_like(X_nhwc);
-  torch::Tensor dweight = torch::empty({C}, X.options());
-  torch::Tensor dbias = torch::empty({C}, X.options());
+  at::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
+  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  at::Tensor dX = at::empty_like(X_nhwc);
+  at::Tensor dweight = at::empty({C}, X.options());
+  at::Tensor dbias = at::empty({C}, X.options());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
-    at::ScalarType::Half,
-    at::ScalarType::BFloat16,
+    c10::ScalarType::Half,
+    c10::ScalarType::BFloat16,
     X.scalar_type(),
     "group_norm_nhwc_backward", [&]() {
-      gn_bwd<scalar_t>(
+      run_gn_bwd_kernels<scalar_t>(
           dy_nhwc, X_nhwc,
           weight, mean, rstd,
           G,

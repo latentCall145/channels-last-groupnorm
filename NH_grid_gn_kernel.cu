@@ -1,13 +1,101 @@
-#include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
-#include <c10/core/ScalarType.h>
-#include <c10/cuda/CUDAMathCompat.h> // rsqrt
+//#include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
 #include <ATen/AccumulateType.h> // acc_type
+#include <ATen/ops/empty_like.h>
+#include <ATen/Dispatch.h> // at_dispatch macro
+#include <c10/cuda/CUDAMathCompat.h> // rsqrt
+#include <c10/core/ScalarType.h>
 #include "scale_shift_kernel.h" // scale_shift
 #include <thrust/pair.h> // thrust::pair
 #include <vector> // std::vector
 #define MAX_THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 #define MAX(a, b) (a > b) ? a : b
 #define MIN(a, b) (a < b) ? a : b
+
+template <typename scalar_t, typename index_t>
+struct WelfordData {
+  scalar_t mean;
+  scalar_t m2;
+  index_t n;
+  scalar_t nf;
+
+  C10_HOST_DEVICE WelfordData() : mean(0), m2(0), n(0), nf(0) {}
+
+  C10_HOST_DEVICE WelfordData(
+      scalar_t mean,
+      scalar_t m2,
+      index_t n,
+      scalar_t nf)
+      : mean(mean), m2(m2), n(n), nf(nf) {}
+};
+
+
+template <typename scalar_t, typename acc_scalar_t, typename index_t, typename res_t>
+struct WelfordOps {
+  acc_scalar_t correction;
+  bool take_sqrt;
+ public:
+  using acc_t = WelfordData<acc_scalar_t, index_t>;
+  inline C10_DEVICE acc_t reduce(acc_t acc, scalar_t data, index_t /*idx*/) const {
+    // We accumulate n in index_t to avoid cumulative rounding error, but still
+    // need nf for use in combine where int32 may overflow.
+    index_t new_n = acc.n + 1;
+    acc_scalar_t new_nf = static_cast<acc_scalar_t>(new_n);
+
+    acc_scalar_t delta = data - acc.mean;
+    
+    acc_scalar_t new_mean = acc.mean + delta / new_nf;
+    acc_scalar_t new_delta = data - new_mean;
+    return {
+      new_mean,
+      acc.m2 + delta * new_delta,
+      new_n,
+      new_nf,
+    };
+  }
+  inline C10_DEVICE acc_t combine(acc_t a, acc_t b) const {
+    if (a.nf == 0) {
+      return b;
+    }
+    if (b.nf == 0) {
+      return a;
+    }
+    acc_scalar_t delta = b.mean - a.mean;
+    acc_scalar_t new_count = a.nf + b.nf;
+    acc_scalar_t nb_over_n = b.nf / new_count;
+    return {
+      a.mean + delta * nb_over_n,
+      a.m2 + b.m2 + delta * delta * a.nf * nb_over_n,
+      // setting acc.n as -1 since acc.n might not be able to represent the count
+      // correctly within its range, setting it to -1 to avoid confusion
+      -1,
+      new_count
+    };
+  }
+  inline C10_DEVICE res_t project(acc_t acc) const __ubsan_ignore_float_divide_by_zero__ {
+    const auto mean = static_cast<scalar_t>(acc.mean);
+    const auto divisor = acc.nf > correction ? acc.nf - correction : 0;
+    const auto var = acc.m2 / divisor;
+    res_t results(take_sqrt ? std::sqrt(var) : var, mean);
+    return results;
+  }
+
+  static C10_DEVICE acc_t translate_idx(acc_t acc, int64_t /*base_idx*/) {
+    return acc;
+  }
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+  inline __device__ acc_t warp_shfl_down(acc_t acc, int offset) const {
+    return {
+      WARP_SHFL_DOWN(acc.mean, offset)
+      , WARP_SHFL_DOWN(acc.m2, offset)
+      , WARP_SHFL_DOWN(acc.n, offset)
+      , WARP_SHFL_DOWN(acc.nf, offset)
+    };
+  }
+#endif
+  C10_HOST_DEVICE WelfordOps(acc_scalar_t correction, bool take_sqrt)
+      : correction(correction), take_sqrt(take_sqrt) {}
+};
 
 template <typename T>
 __global__ void
@@ -17,7 +105,8 @@ NH_compute_stats_pt1(
     const int W,
     const int C,
     const int G,
-    at::native::WelfordData<at::acc_type<T, true>, int> *welford_data
+    //at::native::WelfordData<at::acc_type<T, true>, int> *welford_data
+    WelfordData<at::acc_type<T, true>, int> *welford_data
   ) {
   /*
      C <= MAX_THREADS_PER_BLOCK (Kernel 1):
@@ -38,8 +127,10 @@ NH_compute_stats_pt1(
        output buffer: (N, f, G/f, H)
   */
   using T_ACC = at::acc_type<T, true>;
-  using WelfordType = at::native::WelfordData<T_ACC, int>;
-  using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  //using WelfordType = at::native::WelfordData<T_ACC, int>;
+  //using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  using WelfordType = WelfordData<T_ACC, int>;
+  using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   const int TPB = blockDim.y * blockDim.x;
   const int d = blockDim.y;
 
@@ -49,9 +140,9 @@ NH_compute_stats_pt1(
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[MAX_THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
 
-  const int Wc = W / d;
+  const int w = W / d;
 #pragma unroll 8
-  for (int i = 0; i < Wc; ++i) {
+  for (int i = 0; i < w; ++i) {
     int reduce_idx = 0;
     reduce_idx += blockIdx.x * H * W * C; // dim 0, HWC stride
     reduce_idx += blockIdx.y * W * C; // dim 1, WC stride
@@ -88,11 +179,6 @@ NH_compute_stats_pt1(
   // put reduced outputs into return buffers
   if (tid < gf) {
     int out_idx = 0;
-    //out_idx += blockIdx.x * H * G; // dim 0, HG stride
-    //out_idx += blockIdx.y * G; // dim 1, G stride
-    //out_idx += blockIdx.z * gf; // dim 2, G/f stride
-    //out_idx += threadIdx.x; // dim 3, 1 stride
-
     out_idx += blockIdx.x * G * H; // dim 0, HG stride
     out_idx += blockIdx.z * gf * H; // dim 2, G/f stride
     out_idx += threadIdx.x * H; // dim 3, 1 stride
@@ -104,7 +190,8 @@ NH_compute_stats_pt1(
 template <typename T>
 __global__ void
 NH_compute_stats_pt2(
-    at::native::WelfordData<at::acc_type<T, true>, int> *welford_data,
+    //at::native::WelfordData<at::acc_type<T, true>, int> *welford_data,
+    WelfordData<at::acc_type<T, true>, int> *welford_data,
     const int H,
     const int G,
     const float eps,
@@ -112,77 +199,10 @@ NH_compute_stats_pt2(
     T* rstds
   ) {
   using T_ACC = at::acc_type<T, true>;
-  using WelfordType = at::native::WelfordData<T_ACC, int>;
-  using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
-  /*
-     griddim: (x=N, y=f); blockdim: (x=G/f, y=d)
-      d = num. spatial elements (from H dimension) each thread-block processes in parallel
-      Gd/f = TPB (threads per block)
-     welford_data shape: (N, H, f, G/f) -view-> (N, H/d, d, f, G/f); X stride: (HG, dG, G, G/f, 1)
-     shmem reduction: (d, G/f) -reduce-> G/f
-     output buffer: (N, f, G/f) -view-> (N, G)
-  */
-
-  WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
-  WelfordType val(0, 0, 0, 0);
-  const int TPB = blockDim.y * blockDim.x;
-  const int f = gridDim.y;
-  const int d = blockDim.y;
-  const int gf = G / f;
-
-#pragma unroll 8
-  for (int i = 0; i < H / d; ++i) {
-    int reduce_idx = 0;
-    reduce_idx += blockIdx.x * H * G; // dim 0, stride HG
-    reduce_idx += i * d * G; // dim 1, stride dG
-    reduce_idx += threadIdx.y * G; // dim 2, stride G
-    reduce_idx += blockIdx.y * gf; // dim 3, stride G/f (if f = 1, this adds nothing)
-    reduce_idx += threadIdx.x; // dim 4, stride 1
-    WelfordType x = welford_data[reduce_idx];
-    val = welford_op.combine(val, x);
-  }
-
-  // shmem reduction
-  __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[MAX_THREADS_PER_BLOCK];
-  WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
-
-  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  vals_reduced[tid] = val;
-  __syncthreads();
-
-  for (int stride = TPB / 2; stride >= gf; stride >>= 1) {
-    if (tid < stride)
-      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
-    __syncthreads();
-    }
-
-  // put reduced outputs into return buffers
-  if (tid < gf) {
-    T_ACC m1, m2;
-    thrust::tie(m2, m1) = welford_op.project(vals_reduced[tid]);
-    int out_idx = 0;
-    out_idx += blockIdx.x * G; // dim 0, G stride
-    out_idx += blockIdx.y * gf; // dim 1, G/f stride
-    out_idx += threadIdx.x; // dim 2, 1 stride
-    means[out_idx] = m1;
-    rstds[out_idx] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
-  }
-}
-
-
-template <typename T>
-__global__ void
-NH_compute_stats_pt2B(
-    at::native::WelfordData<at::acc_type<T, true>, int> *welford_data,
-    const int H,
-    const int G,
-    const float eps,
-    T* means,
-    T* rstds
-  ) {
-  using T_ACC = at::acc_type<T, true>;
-  using WelfordType = at::native::WelfordData<T_ACC, int>;
-  using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  //using WelfordType = at::native::WelfordData<T_ACC, int>;
+  //using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  using WelfordType = WelfordData<T_ACC, int>;
+  using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   /*
      griddim: (x=N, y=G); blockdim: (x=H)
       d = num. spatial elements (from H dimension) each thread-block processes in parallel
@@ -224,14 +244,14 @@ NH_compute_stats_pt2B(
 
 template <typename T>
 void NH_gn_fwd(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
     T eps,
-    torch::Tensor& Y,
-    torch::Tensor& means,
-    torch::Tensor& rstds) {
+    at::Tensor& Y,
+    at::Tensor& means,
+    at::Tensor& rstds) {
   const T* X_data = X.const_data_ptr<T>();
   T* mean_data = means.mutable_data_ptr<T>();
   T* rstd_data = rstds.mutable_data_ptr<T>();
@@ -241,13 +261,14 @@ void NH_gn_fwd(
   const int W = X.size(2);
   const int C = X.size(3);
 
-  using WelfordType = at::native::WelfordData<at::acc_type<T, true>, int>;
-  //torch::Tensor welford_tensor = torch::empty({N, H, G, sizeof(WelfordType)}, X.options().dtype(torch::kByte));
-  torch::Tensor welford_tensor = torch::empty({N, G, H, sizeof(WelfordType)}, X.options().dtype(torch::kByte));
+  //using WelfordType = at::native::WelfordData<at::acc_type<T, true>, int>;
+  using WelfordType = WelfordData<at::acc_type<T, true>, int>;
+  at::Tensor welford_tensor = at::empty({N, G, H, sizeof(WelfordType)}, X.options().dtype(at::kByte));
   WelfordType *welford_data = reinterpret_cast<WelfordType *>(welford_tensor.mutable_data_ptr());
   
   int blockDimX, blockDimY, f, TPB;
   TPB = MIN(MAX_THREADS_PER_BLOCK, W * C);
+
   blockDimX = MIN(TPB, C);
   blockDimY = TPB / blockDimX;
   f = MAX(C / TPB, 1); // note: impossible for f > 1 AND blockDimY > 1
@@ -256,19 +277,10 @@ void NH_gn_fwd(
       welford_data
   );
 
-  //TPB = MIN(MAX_THREADS_PER_BLOCK, H * G / f);
-  //blockDimX = MIN(TPB, G / f);
-  //blockDimY = TPB / blockDimX;
-  //NH_compute_stats_pt2<<<dim3(N, f), dim3(blockDimX, blockDimY)>>>(
-  //        welford_data,
-  //        H, G, eps,
-  //        mean_data, rstd_data
-  //  );
-
   TPB = MIN(MAX_THREADS_PER_BLOCK, H * G / f);
   blockDimX = MIN(TPB, G / f);
   blockDimY = TPB / blockDimX;
-  NH_compute_stats_pt2B<<<dim3(N, G), H>>>(
+  NH_compute_stats_pt2<<<dim3(N, G), H>>>(
           welford_data,
           H, G, eps,
           mean_data, rstd_data
@@ -278,18 +290,18 @@ void NH_gn_fwd(
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
-std::vector<torch::Tensor> gn_nhwc_cuda_fwd_NH_grid(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+std::vector<at::Tensor> gn_nhwc_cuda_fwd_NH_grid(
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
     float eps) {
   const int N = X.size(0);
 
-  torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
-  torch::Tensor X_out = torch::empty_like(X_nhwc);
-  torch::Tensor means = torch::empty({N, G}, weight.options());
-  torch::Tensor rstds = torch::empty({N, G}, weight.options());
+  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  at::Tensor X_out = at::empty_like(X_nhwc);
+  at::Tensor means = at::empty({N, G}, weight.options());
+  at::Tensor rstds = at::empty({N, G}, weight.options());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
     at::ScalarType::Half,
