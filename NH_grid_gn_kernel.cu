@@ -2,7 +2,6 @@
 #include <ATen/AccumulateType.h> // acc_type
 #include <ATen/ops/empty_like.h>
 #include <ATen/Dispatch.h> // at_dispatch macro
-#include <c10/cuda/CUDAMathCompat.h> // rsqrt
 #include <c10/core/ScalarType.h>
 #include "scale_shift_kernel.h" // scale_shift
 #include <thrust/pair.h> // thrust::pair
@@ -35,7 +34,7 @@ struct WelfordOps {
   bool take_sqrt;
  public:
   using acc_t = WelfordData<acc_scalar_t, index_t>;
-  inline C10_DEVICE acc_t reduce(acc_t acc, scalar_t data, index_t /*idx*/) const {
+  inline C10_DEVICE acc_t reduce(acc_t acc, scalar_t data) const {
     // We accumulate n in index_t to avoid cumulative rounding error, but still
     // need nf for use in combine where int32 may overflow.
     index_t new_n = acc.n + 1;
@@ -105,7 +104,6 @@ NH_compute_stats_pt1(
     const int W,
     const int C,
     const int G,
-    //at::native::WelfordData<at::acc_type<T, true>, int> *welford_data
     WelfordData<at::acc_type<T, true>, int> *welford_data
   ) {
   /*
@@ -127,8 +125,6 @@ NH_compute_stats_pt1(
        output buffer: (N, f, G/f, H)
   */
   using T_ACC = at::acc_type<T, true>;
-  //using WelfordType = at::native::WelfordData<T_ACC, int>;
-  //using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   using WelfordType = WelfordData<T_ACC, int>;
   using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   const int TPB = blockDim.y * blockDim.x;
@@ -151,7 +147,7 @@ NH_compute_stats_pt1(
     reduce_idx += blockIdx.z * TPB; // dim 4, TPB stride (in kernel 1, threadIdx.z is always 0 so this statement does nothing)
     reduce_idx += threadIdx.x; // dim 5, 1 stride
     T x = X[reduce_idx];
-    val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
+    val = welford_op.reduce(val, static_cast<T_ACC>(x)); // last arg isn't used in src
   }
 
   const int D = C / G;
@@ -190,7 +186,6 @@ NH_compute_stats_pt1(
 template <typename T>
 __global__ void
 NH_compute_stats_pt2(
-    //at::native::WelfordData<at::acc_type<T, true>, int> *welford_data,
     WelfordData<at::acc_type<T, true>, int> *welford_data,
     const int H,
     const int G,
@@ -199,8 +194,6 @@ NH_compute_stats_pt2(
     T* rstds
   ) {
   using T_ACC = at::acc_type<T, true>;
-  //using WelfordType = at::native::WelfordData<T_ACC, int>;
-  //using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   using WelfordType = WelfordData<T_ACC, int>;
   using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   /*
@@ -238,7 +231,7 @@ NH_compute_stats_pt2(
     out_idx += blockIdx.x * G; // dim 0, G stride
     out_idx += blockIdx.y; // dim 1, G/f stride
     means[out_idx] = m1;
-    rstds[out_idx] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
+    rstds[out_idx] = rsqrt(m2 + static_cast<T_ACC>(eps));
   }
 }
 
@@ -287,7 +280,7 @@ void NH_gn_fwd(
     );
 
   scale_shift<T>(X, weight, bias, G, Y, means, rstds);
-  AT_CUDA_CHECK(cudaGetLastError());
+  //AT_CUDA_CHECK(cudaGetLastError());
 }
 
 std::vector<at::Tensor> gn_nhwc_cuda_fwd_NH_grid(
@@ -310,13 +303,9 @@ std::vector<at::Tensor> gn_nhwc_cuda_fwd_NH_grid(
     "group_norm_nhwc_forward_NH_grid", [&]() {
       NH_gn_fwd<scalar_t>(
           X_nhwc,
-          weight,
-          bias,
-          G,
-          eps,
-          X_out,
-          means,
-          rstds
+          weight, bias,
+          G, eps,
+          X_out, means, rstds
       );
   });
   return {X_out.permute({0, 3, 1, 2}), means, rstds};

@@ -1,5 +1,5 @@
 //#include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
-#include <ATen/native/cuda/Loops.cuh> // gpu kernel
+//#include <ATen/native/cuda/Loops.cuh> // gpu kernel
 #include <ATen/AccumulateType.h> // acc_type
 #include <ATen/Tensor.h> // at::tensor
 #include <ATen/ops/empty.h>
@@ -20,11 +20,11 @@ sum_reduce(
   ) {
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 #pragma unroll 8
-  for (int stride = start_stride; stride >= end_stride; stride >>= 1)
-    if (tid < stride) {
+  for (int stride = start_stride; stride >= end_stride; stride >>= 1) {
+    if (tid < stride)
       vals_reduced[tid] += vals_reduced[tid + stride];
     __syncthreads();
-    }
+  }
 }
 
 template <typename T>
@@ -190,6 +190,278 @@ compute_dweight_dbias(
   dbias_data[c] = sum2;
 }
 
+template <typename T, int size_per_float>
+struct alignas(2 * size_per_float) f2 {
+  T x, y;
+};
+
+template <typename T, int size_per_float>
+struct alignas(4 * size_per_float) f4 {
+  T x, y, z, w;
+};
+
+template <typename T, int size_per_float>
+struct alignas(8 * size_per_float) f8 {
+  T x, y, z, w, a, b, c, d;
+};
+
+template <typename T, int LOOP_I>
+__global__ void
+dx_elem_kernel(
+    const T* dy_data,
+    const T* X_data,
+    at::acc_type<T, true>* coef1_data,
+    at::acc_type<T, true>* coef2_data,
+    at::acc_type<T, true>* coef3_data,
+    const int N,
+    const int C,
+    const int G,
+    T* dx_data
+    ) {
+  /*
+     (N, H, W, C) -> (N, H, W, G, D) = (NHWC/512/I, I, 512)
+     C < 512 ->      (N, Hw, I, d, C) -> (N, Hw, I, d, G, D)
+                  .add_owned_output(dX.view({N, H * W, G, D}))
+                  .add_owned_input(dy_nhwc.view({N, H * W, G, D}))
+                  .add_owned_input(X_nhwc.view({N, H * W, G, D}))
+                  .add_owned_input(coef1.view({N, 1, G, D}))
+                  .add_owned_input(coef2.view({N, 1, G, 1}))
+                  .add_owned_input(coef3.view({N, 1, G, 1}))
+     */
+
+  using T_ACC = at::acc_type<T, true>;
+  const int n = (N * blockIdx.x) / gridDim.x;
+  const int c = threadIdx.x % C;
+  //const int g = (G * c) / C;
+  const int nc = n * C + c;
+  const int ng = nc * G / C;
+  T_ACC coef1 = coef1_data[nc];
+  T_ACC coef2 = coef2_data[ng];
+  T_ACC coef3 = coef3_data[ng];
+#pragma unroll LOOP_I
+  for (int i = 0; i < LOOP_I; ++i) {
+    int idx = 0;
+    idx += blockIdx.x * LOOP_I * blockDim.x;
+    idx += i * blockDim.x;
+    idx += threadIdx.x;
+    // (coef1 * static_cast<T_ACC>(dy)) + (coef2 * static_cast<T_ACC>(x)) + coef3;
+    dx_data[idx] = (coef1 * static_cast<T_ACC>(dy_data[idx])) + (coef2 * static_cast<T_ACC>(X_data[idx])) + coef3;
+  }
+}
+
+template <typename T, int LOOP_I, typename V, typename V_ACC>
+__global__ void
+dx_elem_kernelV(
+    const T* dy_data,
+    const T* X_data,
+    at::acc_type<T, true>* coef1_data,
+    at::acc_type<T, true>* coef2_data,
+    at::acc_type<T, true>* coef3_data,
+    const int N,
+    const int C,
+    const int G,
+    T* dx_data
+    ) {
+  using T_ACC = at::acc_type<T, true>;
+  const int n = (N * blockIdx.x) / gridDim.x;
+  const int c = threadIdx.x % (C / sizeof(V));
+  const int g = (G * c) / (C / sizeof(V));
+  const int nc = n * (C / sizeof(V)) + c;
+  const int ng = n * G + g;
+  T_ACC coef2 = coef2_data[ng];
+  T_ACC coef3 = coef3_data[ng];
+  const V *dy_vec = reinterpret_cast<const V*>(dy_data);
+  const V *X_vec = reinterpret_cast<const V*>(X_data);
+  V *dx_vec = reinterpret_cast<V*>(dx_data);
+  V_ACC *coef1_vec = reinterpret_cast<V_ACC*>(coef1_data);
+  V_ACC tmp_coef1 = coef1_vec[nc];
+#pragma unroll LOOP_I
+  for (int i  = 0; i < LOOP_I; ++i) {
+    int idx = 0;
+    idx += blockIdx.x * LOOP_I * blockDim.x;
+    idx += i * blockDim.x;
+    idx += threadIdx.x;
+    //dx_data[idx] = (coef1 * static_cast<T_ACC>(dy_data[idx])) + (coef2 * static_cast<T_ACC>(X_data[idx])) + coef3;
+
+    V tmp_dy = dy_vec[idx];
+    V tmp_X = X_vec[idx];
+
+    if (sizeof(V) == 2) {
+      T dx_x, dx_y;
+      dx_x = (tmp_coef1.x * tmp_dy.x) + (coef2 * tmp_X.x) + coef3;
+      dx_y = (tmp_coef1.y * tmp_dy.y) + (coef2 * tmp_X.y) + coef3;
+      dx_vec[idx] = {dx_x, dx_y};
+    }
+    else if (sizeof(V) == 4) {
+      T dx_x, dx_y, dx_z, dx_w;
+      dx_x = (tmp_coef1.x * tmp_dy.x) + (coef2 * tmp_X.x) + coef3;
+      dx_y = (tmp_coef1.y * tmp_dy.y) + (coef2 * tmp_X.y) + coef3;
+      dx_z = (tmp_coef1.z * tmp_dy.z) + (coef2 * tmp_X.z) + coef3;
+      dx_w = (tmp_coef1.w * tmp_dy.w) + (coef2 * tmp_X.w) + coef3;
+      dx_vec[idx] = {dx_x, dx_y, dx_z, dx_w};
+    }
+    else if (sizeof(V) == 8) {
+      T dx_x, dx_y, dx_z, dx_w, dx_a, dx_b, dx_c, dx_d;
+      dx_x = (tmp_coef1.x * tmp_dy.x) + (coef2 * tmp_X.x) + coef3;
+      dx_y = (tmp_coef1.y * tmp_dy.y) + (coef2 * tmp_X.y) + coef3;
+      dx_z = (tmp_coef1.z * tmp_dy.z) + (coef2 * tmp_X.z) + coef3;
+      dx_w = (tmp_coef1.w * tmp_dy.w) + (coef2 * tmp_X.w) + coef3;
+      dx_a = (tmp_coef1.a * tmp_dy.a) + (coef2 * tmp_X.a) + coef3;
+      dx_b = (tmp_coef1.b * tmp_dy.b) + (coef2 * tmp_X.b) + coef3;
+      dx_c = (tmp_coef1.c * tmp_dy.c) + (coef2 * tmp_X.c) + coef3;
+      dx_d = (tmp_coef1.d * tmp_dy.d) + (coef2 * tmp_X.d) + coef3;
+      dx_vec[idx] = {dx_x, dx_y, dx_z, dx_w, dx_a, dx_b, dx_c, dx_d};
+    }
+  }
+}
+
+template <typename T, int LOOP_I>
+__global__ void
+dx_elem_kernelV2(
+    const T* dy_data,
+    const T* X_data,
+    at::acc_type<T, true>* coef1_data,
+    at::acc_type<T, true>* coef2_data,
+    at::acc_type<T, true>* coef3_data,
+    const int N,
+    const int C,
+    const int G,
+    T* dx_data
+    ) {
+  using T_ACC = at::acc_type<T, true>;
+  using T_vec_dtype = f2<T, sizeof(T)>;
+  const int n = (N * blockIdx.x) / gridDim.x;
+  const int c = threadIdx.x % (C / 2);
+  const int g = (G * c) / (C / 2);
+  const int nc = n * (C / 2) + c;
+  const int ng = n * G + g;
+  T_ACC coef2 = coef2_data[ng];
+  T_ACC coef3 = coef3_data[ng];
+  const T_vec_dtype *dy_vec = reinterpret_cast<const T_vec_dtype*>(dy_data);
+  const T_vec_dtype *X_vec = reinterpret_cast<const T_vec_dtype*>(X_data);
+  T_vec_dtype *dx_vec = reinterpret_cast<T_vec_dtype*>(dx_data);
+  f2<T_ACC, 4> *coef1_vec = reinterpret_cast<f2<T_ACC, 4>*>(coef1_data);
+  f2<T_ACC, 4> tmp_coef1 = coef1_vec[nc];
+#pragma unroll LOOP_I
+  for (int i  = 0; i < LOOP_I; ++i) {
+    int idx = 0;
+    idx += blockIdx.x * LOOP_I * blockDim.x;
+    idx += i * blockDim.x;
+    idx += threadIdx.x;
+    //dx_data[idx] = (coef1 * static_cast<T_ACC>(dy_data[idx])) + (coef2 * static_cast<T_ACC>(X_data[idx])) + coef3;
+
+    T_vec_dtype tmp_dy = dy_vec[idx];
+    T_vec_dtype tmp_X = X_vec[idx];
+    T dx_x, dx_y;
+    dx_x = (tmp_coef1.x * tmp_dy.x) + (coef2 * tmp_X.x) + coef3;
+    dx_y = (tmp_coef1.y * tmp_dy.y) + (coef2 * tmp_X.y) + coef3;
+    dx_vec[idx] = {dx_x, dx_y};
+  }
+}
+
+template <typename T, int LOOP_I>
+__global__ void
+dx_elem_kernelV4(
+    const T* dy_data,
+    const T* X_data,
+    at::acc_type<T, true>* coef1_data,
+    at::acc_type<T, true>* coef2_data,
+    at::acc_type<T, true>* coef3_data,
+    const int N,
+    const int C,
+    const int G,
+    T* dx_data
+    ) {
+  /*
+                  .add_owned_output(dX.view({N, H * W, G, D}))
+                  .add_owned_input(dy_nhwc.view({N, H * W, G, D}))
+                  .add_owned_input(X_nhwc.view({N, H * W, G, D}))
+                  .add_owned_input(coef1.view({N, 1, G, D}))
+                  .add_owned_input(coef2.view({N, 1, G, 1}))
+                  .add_owned_input(coef3.view({N, 1, G, 1}))
+     */
+  using T_ACC = at::acc_type<T, true>;
+  using T_vec_dtype = f4<T, sizeof(T)>;
+  const int n = (N * blockIdx.x) / gridDim.x;
+  const int c = threadIdx.x % (C / 4);
+  const int g = (G * c) / (C / 4);
+  const int nc = n * (C / 4) + c;
+  const int ng = n * G + g;
+  T_ACC coef2 = coef2_data[ng];
+  T_ACC coef3 = coef3_data[ng];
+  const T_vec_dtype *dy_vec = reinterpret_cast<const T_vec_dtype*>(dy_data);
+  const T_vec_dtype *X_vec = reinterpret_cast<const T_vec_dtype*>(X_data);
+  T_vec_dtype *dx_vec = reinterpret_cast<T_vec_dtype*>(dx_data);
+  f4<T_ACC, 4> *coef1_vec = reinterpret_cast<f4<T_ACC, 4>*>(coef1_data);
+  f4<T_ACC, 4> tmp_coef1 = coef1_vec[nc];
+#pragma unroll LOOP_I
+  for (int i  = 0; i < LOOP_I; ++i) {
+    int idx = 0;
+    idx += blockIdx.x * LOOP_I * blockDim.x;
+    idx += i * blockDim.x;
+    idx += threadIdx.x;
+    //dx_data[idx] = (coef1 * static_cast<T_ACC>(dy_data[idx])) + (coef2 * static_cast<T_ACC>(X_data[idx])) + coef3;
+
+    T_vec_dtype tmp_dy = dy_vec[idx];
+    T_vec_dtype tmp_X = X_vec[idx];
+    T dx_x, dx_y, dx_z, dx_w;
+    dx_x = (tmp_coef1.x * tmp_dy.x) + (coef2 * tmp_X.x) + coef3;
+    dx_y = (tmp_coef1.y * tmp_dy.y) + (coef2 * tmp_X.y) + coef3;
+    dx_z = (tmp_coef1.z * tmp_dy.z) + (coef2 * tmp_X.z) + coef3;
+    dx_w = (tmp_coef1.w * tmp_dy.w) + (coef2 * tmp_X.w) + coef3;
+    dx_vec[idx] = {dx_x, dx_y, dx_z, dx_w};
+  }
+}
+
+template <typename T, int LOOP_I>
+__global__ void
+dx_elem_kernelV8(
+    const T* dy_data,
+    const T* X_data,
+    at::acc_type<T, true>* coef1_data,
+    at::acc_type<T, true>* coef2_data,
+    at::acc_type<T, true>* coef3_data,
+    const int N,
+    const int C,
+    const int G,
+    T* dx_data
+    ) {
+  using T_ACC = at::acc_type<T, true>;
+  using T_vec_dtype = f8<T, sizeof(T)>;
+  const int n = (N * blockIdx.x) / gridDim.x;
+  const int c = threadIdx.x % (C / 8);
+  const int g = (G * c) / (C / 8);
+  const int nc = n * (C / 8) + c;
+  const int ng = n * G + g;
+  T_ACC coef2 = coef2_data[ng];
+  T_ACC coef3 = coef3_data[ng];
+  const T_vec_dtype *dy_vec = reinterpret_cast<const T_vec_dtype*>(dy_data);
+  const T_vec_dtype *X_vec = reinterpret_cast<const T_vec_dtype*>(X_data);
+  T_vec_dtype *dx_vec = reinterpret_cast<T_vec_dtype*>(dx_data);
+  f8<T_ACC, 4> *coef1_vec = reinterpret_cast<f8<T_ACC, 4>*>(coef1_data);
+#pragma unroll LOOP_I
+  for (int i = 0; i < LOOP_I; ++i) {
+    int idx = 0;
+    idx += blockIdx.x * LOOP_I * blockDim.x;
+    idx += i * blockDim.x;
+    idx += threadIdx.x;
+
+    f8 tmp_coef1 = coef1_vec[nc];
+    T_vec_dtype tmp_dy = dy_vec[idx];
+    T_vec_dtype tmp_X = X_vec[idx];
+    T dx_x, dx_y, dx_z, dx_w, dx_a, dx_b, dx_c, dx_d;
+    dx_x = (tmp_coef1.x * static_cast<T_ACC>(tmp_dy.x)) + (coef2 * static_cast<T_ACC>(tmp_X.x)) + coef3;
+    dx_y = (tmp_coef1.y * static_cast<T_ACC>(tmp_dy.y)) + (coef2 * static_cast<T_ACC>(tmp_X.y)) + coef3;
+    dx_z = (tmp_coef1.z * static_cast<T_ACC>(tmp_dy.z)) + (coef2 * static_cast<T_ACC>(tmp_X.z)) + coef3;
+    dx_w = (tmp_coef1.w * static_cast<T_ACC>(tmp_dy.w)) + (coef2 * static_cast<T_ACC>(tmp_X.w)) + coef3;
+    dx_a = (tmp_coef1.a * static_cast<T_ACC>(tmp_dy.a)) + (coef2 * static_cast<T_ACC>(tmp_X.a)) + coef3;
+    dx_b = (tmp_coef1.b * static_cast<T_ACC>(tmp_dy.b)) + (coef2 * static_cast<T_ACC>(tmp_X.b)) + coef3;
+    dx_c = (tmp_coef1.c * static_cast<T_ACC>(tmp_dy.c)) + (coef2 * static_cast<T_ACC>(tmp_X.c)) + coef3;
+    dx_d = (tmp_coef1.d * static_cast<T_ACC>(tmp_dy.d)) + (coef2 * static_cast<T_ACC>(tmp_X.d)) + coef3;
+    dx_vec[idx] = {dx_x, dx_y, dx_z, dx_w, dx_a, dx_b, dx_c, dx_d};
+  }
+}
+
 template <typename T>
 void run_gn_bwd_kernels(
       const at::Tensor& dy_nhwc,
@@ -223,7 +495,7 @@ void run_gn_bwd_kernels(
   at::Tensor xdy_dy_sum = at::empty({2, N, C, H}, X_nhwc.options().dtype(kAccType));
   T_ACC* xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
   T_ACC* dy_sum_data = xdy_sum_data + N * C * H;
-  const int TPB = MIN(MAX_THREADS_PER_BLOCK, H * W * C);
+  int TPB = MIN(MAX_THREADS_PER_BLOCK, H * W * C);
   const int blockDimX = MIN(TPB, C);
   const int blockDimY = TPB / blockDimX;
   const int f = MAX(C / TPB, 1); // note: impossible for f > 1 AND blockDimY > 1
@@ -235,7 +507,7 @@ void run_gn_bwd_kernels(
   xdy_dy_sum = xdy_dy_sum.sum(3); // xdy_dy_sum shape now (2, N, C)
   xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
   dy_sum_data = xdy_sum_data + N * C;
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  //C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   T* dweight_data = dweight.mutable_data_ptr<T>();
   T* dbias_data = dbias.mutable_data_ptr<T>();
@@ -244,7 +516,7 @@ void run_gn_bwd_kernels(
       xdy_sum_data, dy_sum_data,
       N, C, G,
       dweight_data, dbias_data);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  //C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   at::Tensor coef1 = at::empty({N, C}, X_nhwc.options().dtype(kAccType));
   at::Tensor coef2 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
@@ -257,8 +529,9 @@ void run_gn_bwd_kernels(
       xdy_sum_data, dy_sum_data,
       H, W, C, G,
       coef1_data, coef2_data, coef3_data);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  //C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+  /*
   at::TensorIterator iter = at::TensorIteratorConfig()
                   .check_all_same_dtype(std::is_same<T, T_ACC>::value)
                   .resize_outputs(false)
@@ -273,7 +546,41 @@ void run_gn_bwd_kernels(
       iter, [] GPU_LAMBDA(T dy, T x, T_ACC coef1, T_ACC coef2, T_ACC coef3) -> T {
         return (coef1 * static_cast<T_ACC>(dy)) + (coef2 * static_cast<T_ACC>(x)) + coef3;
       });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      */
+
+  T *dx_data = dX.mutable_data_ptr<T>();
+  const int ELEM_KERNEL_TPB = 512;
+  const int LOOP_I = 8;
+
+  if (D == 1)
+    dx_elem_kernel<T, LOOP_I><<<N * H * W * C / ELEM_KERNEL_TPB / LOOP_I, ELEM_KERNEL_TPB>>>(
+        dy_data, X_data,
+        coef1_data, coef2_data, coef3_data,
+        N, C, G,
+        dx_data
+        );
+  else if (D == 2)
+    dx_elem_kernelV2<T, LOOP_I><<<N * H * W * C / ELEM_KERNEL_TPB / LOOP_I / 2, ELEM_KERNEL_TPB>>>(
+        dy_data, X_data,
+        coef1_data, coef2_data, coef3_data,
+        N, C, G,
+        dx_data
+        );
+  else if (D < 8)
+    dx_elem_kernelV4<T, LOOP_I><<<N * H * W * C / ELEM_KERNEL_TPB / LOOP_I / 4, ELEM_KERNEL_TPB>>>(
+        dy_data, X_data,
+        coef1_data, coef2_data, coef3_data,
+        N, C, G,
+        dx_data
+        );
+  else
+    dx_elem_kernelV8<T, LOOP_I><<<N * H * W * C / ELEM_KERNEL_TPB / LOOP_I / 8, ELEM_KERNEL_TPB>>>(
+        dy_data, X_data,
+        coef1_data, coef2_data, coef3_data,
+        N, C, G,
+        dx_data
+        );
+  //C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 std::vector<at::Tensor> gn_nhwc_cuda_bwd(

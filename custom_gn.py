@@ -136,47 +136,48 @@ if __name__ == '__main__':
         #    gn2.bias.copy_(b)
         g1 = gn1(x.contiguous())
         g2 = gn2(x)
-        #g1sum = g1.sum()
-        #g2sum = g2.sum()
-        #rand_dy = torch.rand_like(g2)
-        #g1sum = (g1 * rand_dy).sum()
-        #g2sum = (g2 * rand_dy).sum()
+        g1sum = g1.sum()
+        g2sum = g2.sum()
+        rand_dy = torch.rand_like(g2)
+        g1sum = (g1 * rand_dy).sum()
+        g2sum = (g2 * rand_dy).sum()
 
-        #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
-        #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
-        #g1_grad_wrt_w = g1_grad_wrt_w.reshape((gn1.weight.numel(),))
-        #g2_grad_wrt_w = g2_grad_wrt_w.reshape((gn2.weight.numel(),))
+        g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
+        g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
+        g1_grad_wrt_w = g1_grad_wrt_w.reshape((gn1.weight.numel(),))
+        g2_grad_wrt_w = g2_grad_wrt_w.reshape((gn2.weight.numel(),))
 
-        #g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
-        #g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
+        g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
+        g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
 
-        #g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-        #g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+        g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+        g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
 
         print('FORWARD')
         print(g1 - g2)
-        #print('BACKWARD')
-        #print('g1 sum wrt w')
-        #print(g1_grad_wrt_w - g2_grad_wrt_w)
-        #print('g1 sum wrt b')
-        #print(g1_grad_wrt_b - g2_grad_wrt_b)
-        #print('g1 sum wrt x')
-        #print(g1_grad_wrt_x-g2_grad_wrt_x)
+        print('BACKWARD')
+        print('g1 sum wrt w')
+        print(g1_grad_wrt_w - g2_grad_wrt_w)
+        print('g1 sum wrt b')
+        print(g1_grad_wrt_b - g2_grad_wrt_b)
+        print('g1 sum wrt x')
+        print(g2_grad_wrt_x.reshape(B, 2, C//2, R*R)[0][1])
+        print(g1_grad_wrt_x-g2_grad_wrt_x)
 
     if MODE != 'check':
-        NSEC = 5 # number of seconds that each kernel runs for on a certain input
+        NSEC = 1 # number of seconds that each kernel runs for on a certain input
         BATCHES = [1, 2, 4, 8, 16, 32]
         CHANNELS = [32, 64, 128, 256, 512]
         RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
         NUM_GROUPS = [4, 8, 16, 32, 64, 128]
         GN_KERNELS = [
                 #(GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
-                #(GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
+                (GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
                 #(GN_NHWC, 'GN NHWC N grid (custom op)', gn_op.fwd_N_grid),
                 #(GN_NHWC, 'GN NHWC NG grid NG grid (custom op)', gn_op.fwd_NG_grid),
-                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', gn_op.nchwforward),
-                (GN_NHWC, 'GN NHWC', None),
-                (GN_NCHW, 'torch.nn GN NCHW (compiled from src)', None)
+                (GN_NCHW, 'torch.nn GN NCHW (compiled from src)', gn_op.nchwforward),
+                #(GN_NHWC, 'GN NHWC', None),
+                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', None)
         ]
 
         os.makedirs('csvs', exist_ok=True)
@@ -191,19 +192,26 @@ if __name__ == '__main__':
                 return False
 
             return (B, C, R, G) in {
-                    #(1, 64, 256, 16),
-                    #(2, 64, 256, 16),
-                    #(4, 64, 256, 16),
-                    #(8, 64, 256, 16),
-                    #(16, 64, 256, 16),
-                    #(32, 64, 256, 16),
+                    (1,  512, 8, 32),
+                    (2,  512, 8, 32),
+                    (4,  512, 8, 32),
+                    (8,  512, 8, 32),
+                    (16, 512, 8, 32),
+                    (32, 512, 8, 32),
 
-                    #(1, 128, 64, 16),
+                    (1, 64, 256, 16),
+                    (2, 64, 256, 16),
+                    (4, 64, 256, 16),
+                    (8, 64, 256, 16),
+                    (16, 64, 256, 16),
+                    (32, 64, 256, 16),
+
+                    (1, 128, 64, 16),
                     (2, 128, 64, 16),
-                    #(4, 128, 32, 16),
-                    #(8, 128, 32, 16),
-                    #(16, 128, 32, 16),
-                    #(32, 128, 32, 16),
+                    (4, 128, 32, 16),
+                    (8, 128, 32, 16),
+                    (16, 128, 32, 16),
+                    (32, 128, 32, 16),
                     }
 
             dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
@@ -220,7 +228,7 @@ if __name__ == '__main__':
             x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
 
             gn_args = (G, C)
-            BENCH = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
+            BENCH = 'bwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
             print(BENCH, 'X shape:', x_nchw.shape, 'G (num groups):', G)
             for gn_class, desc, fwd_fn in GN_KERNELS:
                 gn_input = x_nchw if 'NCHW' in desc else x_nhwc
