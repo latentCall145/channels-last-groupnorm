@@ -9,6 +9,7 @@
 #define MAX(a, b) (a > b) ? a : b
 #define MIN(a, b) (a < b) ? a : b
 
+// copied from https://github.com/pytorch/pytorch/blob/b8307513e57f8beaf99daff342a23d705a417e11/aten/src/ATen/native/SharedReduceOps.h
 template <typename scalar_t, typename index_t>
 struct WelfordData {
   scalar_t mean;
@@ -26,29 +27,29 @@ struct WelfordData {
       : mean(mean), m2(m2), n(n), nf(nf) {}
 };
 
-
+// copied from https://github.com/pytorch/pytorch/blob/b8307513e57f8beaf99daff342a23d705a417e11/aten/src/ATen/native/SharedReduceOps.h
 template <typename scalar_t, typename acc_scalar_t, typename index_t, typename res_t>
 struct WelfordOps {
   acc_scalar_t correction;
   bool take_sqrt;
- public:
-  using acc_t = WelfordData<acc_scalar_t, index_t>;
-  inline C10_DEVICE acc_t reduce(acc_t acc, scalar_t data) const {
-    // We accumulate n in index_t to avoid cumulative rounding error, but still
-    // need nf for use in combine where int32 may overflow.
-    index_t new_n = acc.n + 1;
-    acc_scalar_t new_nf = static_cast<acc_scalar_t>(new_n);
+  public:
+    using acc_t = WelfordData<acc_scalar_t, index_t>;
+    inline C10_DEVICE acc_t reduce(acc_t acc, scalar_t data) const {
+      // We accumulate n in index_t to avoid cumulative rounding error, but still
+      // need nf for use in combine where int32 may overflow.
+      index_t new_n = acc.n + 1;
+      acc_scalar_t new_nf = static_cast<acc_scalar_t>(new_n);
 
-    acc_scalar_t delta = data - acc.mean;
-    
-    acc_scalar_t new_mean = acc.mean + delta / new_nf;
-    acc_scalar_t new_delta = data - new_mean;
-    return {
-      new_mean,
-      acc.m2 + delta * new_delta,
-      new_n,
-      new_nf,
-    };
+      acc_scalar_t delta = data - acc.mean;
+      
+      acc_scalar_t new_mean = acc.mean + delta / new_nf;
+      acc_scalar_t new_delta = data - new_mean;
+      return {
+        new_mean,
+        acc.m2 + delta * new_delta,
+        new_n,
+        new_nf,
+      };
   }
   inline C10_DEVICE acc_t combine(acc_t a, acc_t b) const {
     if (a.nf == 0) {
@@ -253,7 +254,6 @@ void NH_gn_fwd(
   const int W = X.size(2);
   const int C = X.size(3);
 
-  //using WelfordType = at::native::WelfordData<at::acc_type<T, true>, int>;
   using WelfordType = WelfordData<at::acc_type<T, true>, int>;
   at::Tensor welford_tensor = at::empty({N, G, H, sizeof(WelfordType)}, X.options().dtype(at::kByte));
   WelfordType *welford_data = reinterpret_cast<WelfordType *>(welford_tensor.mutable_data_ptr());
@@ -279,7 +279,7 @@ void NH_gn_fwd(
     );
 
   scale_shift<T>(X, weight, bias, G, Y, means, rstds);
-  //AT_CUDA_CHECK(cudaGetLastError());
+  AT_CUDA_CHECK(cudaGetLastError());
 }
 
 std::vector<at::Tensor> gn_nhwc_cuda_fwd_NH_grid(

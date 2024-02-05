@@ -225,136 +225,6 @@ struct alignas(8 * sizeof(T)) float_vec<T, 8> {
   }
 };
 
-template <typename T, int vec_elems>
-__global__ void
-spatial_loopV(
-      const T* dy_data,
-      const T* X_data,
-      const int N,
-      const int H,
-      const int W,
-      const int C,
-      at::acc_type<T, true>* xdy_sum_data,
-      at::acc_type<T, true>* dy_sum_data) {
-  /*
-     Performs a loop over the spatial dimension W, loading and summing dy and X. Spatial dimension H is processed in a separate kernel.
-     C <= MAX_THREADS_PER_BLOCK (Kernel 1):
-       griddim: (x=N, y=H, z=f=1); blockdim: (x=C, y=d)
-        f = factor of channels that each thread have to process separately
-        d = num. spatial elements (from HW dimension) each thread-block processes in parallel
-        Cd = TPB (threads per block)
-       X shape: (N, H, W, C) -view-> (N, H, W/d, d, 1, C); X stride: (HWC, WC, dC, C, C, 1)
-       shmem reduction: (d, C) -reduce-> C
-       output buffer: (N, C, H)
-     C > MAX_THREADS_PER_BLOCK (Kernel 2):
-       griddim: (x=N, y=H, z=f); blockdim: (x=TPB, y=d=1)
-        f = factor of channels that each thread have to process separately
-        d = num. spatial elements (from HW dimension) each thread-block processes in parallel
-        f * TPB = C
-       X shape: (N, H, W, C) -view-> (N, H, W/d, d, f, TPB); X stride: (HWC, WC, dC, C, TPB, 1)
-       shmem reduction: (d, TPB) -reduce-> TPB
-       output buffer: (N, f, TPB, H) -view-> (N, C, H)
-   */
-
-  using T_ACC = at::acc_type<T, true>;
-  using V = float_vec<T, vec_elems>;
-  using V_ACC = float_vec<T_ACC, vec_elems>;
-  const int CV = C / vec_elems;
-  const int TPB = blockDim.y * blockDim.x;
-  const int d = blockDim.y;
-  const int w = W / d;
-  V_ACC xdy_sum{};
-  V_ACC dy_sum{};
-
-  const V* dy_vec = reinterpret_cast<const V*>(dy_data);
-  const V* X_vec = reinterpret_cast<const V*>(X_data);
-  V_ACC* xdy_sum_vec = reinterpret_cast<V_ACC*>(xdy_sum_data);
-  V_ACC* dy_sum_vec = reinterpret_cast<V_ACC*>(dy_sum_data);
-
-#pragma unroll 8
-  for (int i = 0; i < w; ++i) {
-    int reduce_idx = 0;
-    reduce_idx += blockIdx.x * H * W * CV; // dim 0, HWC stride
-    reduce_idx += blockIdx.y * W * CV; // dim 1, WC stride
-    reduce_idx += i * d * CV; // dim 2, dC stride
-    reduce_idx += threadIdx.y * CV; // dim 3, C stride
-    reduce_idx += blockIdx.z * TPB; // dim 4, TPB stride (in kernel 1, threadIdx.z is always 0 so this statement does nothing)
-    reduce_idx += threadIdx.x; // dim 5, 1 stride
-
-    V dy_elem = dy_vec[reduce_idx];
-    V X_elem = X_vec[reduce_idx];
-
-    if constexpr (vec_elems == 1) {
-      xdy_sum.x += dy_elem.x * X_elem.x;
-      dy_sum.x += dy_elem.x;
-    }
-    else if constexpr (vec_elems == 2) {
-      xdy_sum.x += dy_elem.x * X_elem.x;
-      xdy_sum.y += dy_elem.y * X_elem.y;
-      dy_sum.x += dy_elem.x;
-      dy_sum.y += dy_elem.y;
-    }
-    else if constexpr (vec_elems == 4) {
-      xdy_sum.x += dy_elem.x * X_elem.x;
-      xdy_sum.y += dy_elem.y * X_elem.y;
-      xdy_sum.z += dy_elem.z * X_elem.z;
-      xdy_sum.w += dy_elem.w * X_elem.w;
-      dy_sum.x += dy_elem.x;
-      dy_sum.y += dy_elem.y;
-      dy_sum.z += dy_elem.z;
-      dy_sum.w += dy_elem.w;
-    }
-    else if constexpr (vec_elems == 8) {
-      xdy_sum.x += dy_elem.x * X_elem.x;
-      xdy_sum.y += dy_elem.y * X_elem.y;
-      xdy_sum.z += dy_elem.z * X_elem.z;
-      xdy_sum.w += dy_elem.w * X_elem.w;
-      xdy_sum.a += dy_elem.a * X_elem.a;
-      xdy_sum.b += dy_elem.b * X_elem.b;
-      xdy_sum.c += dy_elem.c * X_elem.c;
-      xdy_sum.d += dy_elem.d * X_elem.d;
-      dy_sum.x += dy_elem.x;
-      dy_sum.y += dy_elem.y;
-      dy_sum.z += dy_elem.z;
-      dy_sum.w += dy_elem.w;
-      dy_sum.a += dy_elem.a;
-      dy_sum.b += dy_elem.b;
-      dy_sum.c += dy_elem.c;
-      dy_sum.d += dy_elem.d;
-    }
-  }
-
-  // shmem reduction
-  extern __shared__ char vals_reduced_uncasted[]; // size 2*TPB*vec_elems, TPB*vec_elems for sum1, TPB*vec_elems for sum2
-  T_ACC *vals_reduced = reinterpret_cast<T_ACC*>(vals_reduced_uncasted);
-  V_ACC *vals_reduced_vec = reinterpret_cast<V_ACC*>(vals_reduced_uncasted);
-
-  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-
-  vals_reduced_vec[2 * tid] = xdy_sum;
-  vals_reduced_vec[2 * tid + 1] = dy_sum;
-  __syncthreads();
-  for (int i = 1; i < vec_elems; ++i) {
-    const int shift = i * 2 * TPB;
-    vals_reduced[tid] += vals_reduced[shift + tid];
-    vals_reduced[TPB + tid] += vals_reduced[shift + TPB + tid];
-  }
-  __syncthreads();
-  sum_reduce(vals_reduced, TPB, 2 * C);
-
-  // put reduced outputs into return buffers
-  if (tid < CV) {
-    int out_idx = 0;
-    out_idx += blockIdx.y * N * CV; // dim 3, 1 stride
-    out_idx += blockIdx.x * CV; // dim 0, CH stride
-    out_idx += blockIdx.z * TPB; // dim 1, TPB*H stride (if f=1, this line is a no-op)
-    out_idx += threadIdx.x; // dim 2, H stride
-
-    xdy_sum_vec[out_idx] = vals_reduced_vec[2 * tid];
-    dy_sum_vec[out_idx] = vals_reduced_vec[2 * tid + 1];
-  }
-}
-
 template <typename T, int LOOP_I, int vec_elems>
 __global__ void
 dx_elem_kernel(
@@ -456,7 +326,6 @@ void run_gn_bwd_kernels(
       : X_nhwc.scalar_type();
 
   at::Tensor xdy_dy_sum = at::empty({2, N, C, H}, X_nhwc.options().dtype(kAccType));
-  //at::Tensor xdy_dy_sum = at::empty({2, H, N, C}, X_nhwc.options().dtype(kAccType));
   T_ACC* xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
   T_ACC* dy_sum_data = xdy_sum_data + N * C * H;
 
@@ -469,19 +338,8 @@ void run_gn_bwd_kernels(
       H, W, C,
       xdy_sum_data, dy_sum_data);
 
-  //const int V = 2;
-  //int TPB = MIN(MAX_THREADS_PER_BLOCK, H * W * C / V);
-  //const int blockDimX = MIN(TPB, C / V);
-  //const int blockDimY = TPB / blockDimX;
-  //const int f = MAX(C / TPB, 1); // note: impossible for f > 1 AND blockDimY > 1
-  //spatial_loopV<T, V><<<dim3(N, H, f), dim3(blockDimX, blockDimY), sizeof(T_ACC) * V * TPB * V>>>(
-  //    dy_data, X_data, 
-  //    N, H, W, C,
-  //    xdy_sum_data, dy_sum_data);
-
   // sum over H dimension
   xdy_dy_sum = xdy_dy_sum.sum(3); // xdy_dy_sum shape now (2, N, C)
-  //xdy_dy_sum = xdy_dy_sum.sum(1); // xdy_dy_sum shape now (2, N, C)
   xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
   dy_sum_data = xdy_sum_data + N * C;
   C10_CUDA_KERNEL_LAUNCH_CHECK();

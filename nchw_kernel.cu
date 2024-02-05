@@ -1,5 +1,5 @@
 // Copied from https://github.com/pytorch/pytorch/blob/8852bb561cbc821ffebf395990ee12a7ea376612/aten/src/ATen/native/cuda/group_norm_kernel.cu with slight style modifications
-//#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/group_norm.h>
 
 #include <type_traits>
@@ -16,13 +16,11 @@
 #include <ATen/native/cuda/Loops.cuh>
 #include <ATen/native/cuda/block_reduce.cuh>
 
+#ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
+#else
 #include <ATen/ops/empty.h>
-#include <torch/extension.h>
-
-#include <c10/core/Device.h>
-#include <c10/core/DeviceType.h>
-#include <c10/core/ScalarType.h>
+#endif
 
 constexpr int kCUDANumThreads = 256;
 constexpr int kReduceTileSize = 32;
@@ -480,15 +478,15 @@ __global__ void GammaBetaBackwardCUDAKernelF2(
 
 template <typename T>
 void GroupNorm1dForward(
-    const torch::Tensor& X,
-    const torch::Tensor& mean,
-    const torch::Tensor& rstd,
-    const torch::Tensor& gamma,
-    const torch::Tensor& beta,
+    const at::Tensor& X,
+    const at::Tensor& mean,
+    const at::Tensor& rstd,
+    const at::Tensor& gamma,
+    const at::Tensor& beta,
     int64_t N,
     int64_t C,
     int64_t group,
-    torch::Tensor& Y) {
+    at::Tensor& Y) {
   using T_ACC = at::acc_type<T, true>;
   const int64_t G = group;
   const int64_t D = C / G;
@@ -552,17 +550,17 @@ void GroupNorm1dForward(
 
 template <typename T>
 void GroupNormKernelImplInternal(
-    const torch::Tensor& X,
-    const torch::Tensor& gamma,
-    const torch::Tensor& beta,
+    const at::Tensor& X,
+    const at::Tensor& gamma,
+    const at::Tensor& beta,
     int64_t N,
     int64_t C,
     int64_t HxW,
     int64_t group,
     T eps,
-    torch::Tensor& Y,
-    torch::Tensor& mean,
-    torch::Tensor& rstd) {
+    at::Tensor& Y,
+    at::Tensor& mean,
+    at::Tensor& rstd) {
   using T_ACC = at::acc_type<T, true>;
   TORCH_CHECK(X.numel() == N * C * HxW);
   TORCH_CHECK(!gamma.defined() || gamma.numel() == C);
@@ -603,8 +601,8 @@ void GroupNormKernelImplInternal(
         (X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16)
         ? at::kFloat
         : X.scalar_type();
-    torch::Tensor a = at::empty({N, C}, X.options().dtype(kAccType));
-    torch::Tensor b = at::empty({N, C}, X.options().dtype(kAccType));
+    at::Tensor a = at::empty({N, C}, X.options().dtype(kAccType));
+    at::Tensor b = at::empty({N, C}, X.options().dtype(kAccType));
     const T* gamma_data = gamma.defined() ? gamma.const_data_ptr<T>() : nullptr;
     const T* beta_data = beta.defined() ? beta.const_data_ptr<T>() : nullptr;
     T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
@@ -634,17 +632,17 @@ void GroupNormKernelImplInternal(
 }
 
 void GroupNormKernelImpl(
-    const torch::Tensor& X,
-    const torch::Tensor& gamma,
-    const torch::Tensor& beta,
+    const at::Tensor& X,
+    const at::Tensor& gamma,
+    const at::Tensor& beta,
     int64_t N,
     int64_t C,
     int64_t HxW,
     int64_t group,
     double eps,
-    torch::Tensor& Y,
-    torch::Tensor& mean,
-    torch::Tensor& rstd) {
+    at::Tensor& Y,
+    at::Tensor& mean,
+    at::Tensor& rstd) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -668,17 +666,17 @@ void GroupNormKernelImpl(
 
 template <typename T>
 void GroupNorm1dBackward(
-    const torch::Tensor dY,
-    const torch::Tensor X,
-    const torch::Tensor mean,
-    const torch::Tensor rstd,
-    const torch::Tensor gamma,
+    const at::Tensor dY,
+    const at::Tensor X,
+    const at::Tensor mean,
+    const at::Tensor rstd,
+    const at::Tensor gamma,
     int64_t N,
     int64_t C,
     int64_t group,
-    torch::Tensor& dX,
-    torch::Tensor& dgamma,
-    torch::Tensor& dbeta) {
+    at::Tensor& dX,
+    at::Tensor& dgamma,
+    at::Tensor& dbeta) {
   using T_ACC = at::acc_type<T, true>;
   const int64_t G = group;
   const int64_t D = C / G;
@@ -694,8 +692,8 @@ void GroupNorm1dBackward(
         (X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16)
         ? at::kFloat
         : X.scalar_type();
-    torch::Tensor c2 = at::empty({N, G}, X.options().dtype(kAccType));
-    torch::Tensor c3 = at::empty({N, G}, X.options().dtype(kAccType));
+    at::Tensor c2 = at::empty({N, G}, X.options().dtype(kAccType));
+    at::Tensor c3 = at::empty({N, G}, X.options().dtype(kAccType));
     T_ACC* c2_data = c2.mutable_data_ptr<T_ACC>();
     T_ACC* c3_data = c3.mutable_data_ptr<T_ACC>();
     const int64_t num_threads = (C / G) < at::native::cuda_utils::kCUDABlockReduceNumThreads
@@ -799,18 +797,18 @@ void GroupNorm1dBackward(
 
 template <typename T>
 void GroupNormBackwardKernelImplInternal(
-    const torch::Tensor& dY,
-    const torch::Tensor& X,
-    const torch::Tensor& mean,
-    const torch::Tensor& rstd,
-    const torch::Tensor& gamma,
+    const at::Tensor& dY,
+    const at::Tensor& X,
+    const at::Tensor& mean,
+    const at::Tensor& rstd,
+    const at::Tensor& gamma,
     int64_t N,
     int64_t C,
     int64_t HxW,
     int64_t group,
-    torch::Tensor& dX,
-    torch::Tensor& dgamma,
-    torch::Tensor& dbeta) {
+    at::Tensor& dX,
+    at::Tensor& dgamma,
+    at::Tensor& dbeta) {
   using T_ACC = at::acc_type<T, true>;
   const int64_t G = group;
   const int64_t D = C / G;
@@ -840,8 +838,8 @@ void GroupNormBackwardKernelImplInternal(
       (X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16)
       ? at::kFloat
       : X.scalar_type();
-  torch::Tensor ds = at::empty({N, C}, X.options().dtype(kAccType));
-  torch::Tensor db = at::empty({N, C}, X.options().dtype(kAccType));
+  at::Tensor ds = at::empty({N, C}, X.options().dtype(kAccType));
+  at::Tensor db = at::empty({N, C}, X.options().dtype(kAccType));
   T_ACC* ds_data = ds.mutable_data_ptr<T_ACC>();
   T_ACC* db_data = db.mutable_data_ptr<T_ACC>();
 
@@ -862,9 +860,9 @@ void GroupNormBackwardKernelImplInternal(
   //std::cout << "db: " << db << '\n';
 
   if (dX.defined()) {
-    torch::Tensor c1 = at::empty({0}, X.options().dtype(kAccType));
-    torch::Tensor c2 = at::empty({N, G}, X.options().dtype(kAccType));
-    torch::Tensor c3 = at::empty({N, G}, X.options().dtype(kAccType));
+    at::Tensor c1 = at::empty({0}, X.options().dtype(kAccType));
+    at::Tensor c2 = at::empty({N, G}, X.options().dtype(kAccType));
+    at::Tensor c3 = at::empty({N, G}, X.options().dtype(kAccType));
     T_ACC* c2_data = c2.mutable_data_ptr<T_ACC>();
     T_ACC* c3_data = c3.mutable_data_ptr<T_ACC>();
 
@@ -972,18 +970,18 @@ void GroupNormBackwardKernelImplInternal(
 }
 
 void GroupNormBackwardKernelImpl(
-    const torch::Tensor& dY,
-    const torch::Tensor& X,
-    const torch::Tensor& mean,
-    const torch::Tensor& rstd,
-    const torch::Tensor& gamma,
+    const at::Tensor& dY,
+    const at::Tensor& X,
+    const at::Tensor& mean,
+    const at::Tensor& rstd,
+    const at::Tensor& gamma,
     int64_t N,
     int64_t C,
     int64_t HxW,
     int64_t group,
-    torch::Tensor& dX,
-    torch::Tensor& dgamma,
-    torch::Tensor& dbeta) {
+    at::Tensor& dX,
+    at::Tensor& dgamma,
+    at::Tensor& dbeta) {
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
