@@ -1,4 +1,3 @@
-//#include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
 #include <ATen/AccumulateType.h> // acc_type
 #include <ATen/ops/empty_like.h>
 #include <ATen/Dispatch.h> // at_dispatch macro
