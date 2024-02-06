@@ -111,6 +111,7 @@ scale_shift_elem_kernelV(
   //const int c = threadIdx.x % (C / vec_elems);
   const int c = (blockIdx.y * blockDim.x + threadIdx.x) % (C / vec_elems);
   const int nc = n * (C / vec_elems) + c;
+  const int num_vecs = gridDim.x * gridDim.y * LOOP_I * blockDim.x;
   const V *X_vec = reinterpret_cast<const V*>(X_data);
   V *y_vec = reinterpret_cast<V*>(y);
   V_ACC *a_vec = reinterpret_cast<V_ACC*>(a_data);
@@ -123,6 +124,9 @@ scale_shift_elem_kernelV(
     idx += i * gridDim.y * blockDim.x;
     idx += blockIdx.y * blockDim.x;
     idx += threadIdx.x;
+    if (idx > num_vecs)
+      continue;
+
     V tmp_X = X_vec[idx];
     V_ACC tmp_a = a_vec[nc];
     V_ACC tmp_b = b_vec[nc];
@@ -191,6 +195,7 @@ small_scale_shift_elem_kernelV(
     idx += i * gridDim.y * blockDim.x;
     idx += blockIdx.y * blockDim.x;
     idx += threadIdx.x;
+
     V tmp_X = x_vec[idx];
 
     if constexpr (vec_elems == 1)
@@ -224,136 +229,84 @@ small_scale_shift_elem_kernelV(
   }
 }
 
-// note: fn body inside header file as template fn don't work in non-header files
-// note: when fn body is modified, must recompile all modules that call this fn so they can adopt the change (since headers aren't compiled)
-template <typename T>
-void scale_shift(
-    const at::Tensor& X,
-    const at::Tensor& weight,
-    const at::Tensor& bias,
+/*
+template <typename T, int LOOP_I, int vec_elems>
+__global__ void
+small_scale_shift_elem_kernelV(
+    const T* X_data,
+    const T* mean_data,
+    const T* rstd_data,
+    const T* weight_data,
+    const T* bias_data,
+    const int N,
+    const int H,
+    const int W,
+    const int C,
     const int G,
-    at::Tensor& Y,
-    at::Tensor& means,
-    at::Tensor& rstds) {
+    T* y
+    ) {
   using T_ACC = at::acc_type<T, true>;
-  const T* X_data = X.const_data_ptr<T>();
-  T* mean_data = means.mutable_data_ptr<T>();
-  T* rstd_data = rstds.mutable_data_ptr<T>();
-  T* Y_data = Y.mutable_data_ptr<T>();
+  using V = float_vec<T, vec_elems>;
+  const int n = blockIdx.x;
+  const int c = (blockIdx.z * blockDim.x + threadIdx.x) % (C / vec_elems);
+  const int g = (G * c) / (C / vec_elems);
+  const int ng = n * G + g;
+  const V *x_vec = reinterpret_cast<const V*>(X_data);
+  const V *weight_vec = reinterpret_cast<const V*>(weight_data);
+  const V *bias_vec = reinterpret_cast<const V*>(bias_data);
+  V *y_vec = reinterpret_cast<V*>(y);
+  T mean = mean_data[ng];
+  T rstd = rstd_data[ng];
+  V weight_tmp = weight_vec[c];
+  V bias_tmp = bias_vec[c];
+        //(N, ceil((float)HWC/TPB/LOOP_I/f/vec_elems), f), TPB
 
-  const int N = X.size(0);
-  const int H = X.size(1);
-  const int W = X.size(2);
-  const int C = X.size(3);
+  const int vecs_per_n = H * W * C / vec_elems;
+  const int n_shift = gridDim.y * LOOP_I * gridDim.z * blockDim.x;
+#pragma unroll LOOP_I
+  for (int i = 0; i < LOOP_I; ++i) {
+    int idx = 0;
+    idx += blockIdx.x * n_shift;
+    idx += blockIdx.y * LOOP_I * gridDim.z * blockDim.x;
+    idx += i * gridDim.z * blockDim.x;
+    idx += blockIdx.z * blockDim.x;
+    idx += threadIdx.x;
+    if ((idx % n_shift) >= vecs_per_n)
+      continue;
 
-  int TPB = 512;
-  int f = 1;
-  if (C <= 512)
-    TPB = C;
-  else
-    while (C % f != 0 || C / f > 512)
-      ++f;
-  TPB = C / f;
+    V tmp_X = x_vec[idx];
 
-  if (H * W >= 1024) { // add fused scale-bias kernel to reduce num math ops on each element in the elementwise kernel if the spatial resolution is large
-    const T* weight_data = weight.const_data_ptr<T>();
-    const T* bias_data = bias.const_data_ptr<T>();
-
-    const at::ScalarType kAccType =
-        (X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16)
-        ? at::kFloat
-        : X.scalar_type();
-
-    at::Tensor a = at::empty({N, C}, X.options().dtype(kAccType));
-    at::Tensor b = at::empty({N, C}, X.options().dtype(kAccType));
-    T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
-    T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
-
-    //compute_scale_biases<<<N, C>>>( // note: max(D, T) threads per block
-    //printf("starting compute_scale_biases N: %d H %d W %d C %d G %d TPB %d f %d\n", N, H, W, C, G, TPB, f);
-    compute_scale_biases<<<dim3(N, f), TPB>>>( // note: max(D, T) threads per block
-        mean_data, rstd_data,
-        weight_data, bias_data,
-        G, C,
-        a_data, b_data);
-
-    /*
-     at::TensorIterator iter = at::TensorIteratorConfig()
-        .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC
-        .resize_outputs(false)
-        .add_owned_output(Y.view({N, H * W, C}))
-        .add_owned_input(X.view({N, H * W, C}))
-        .add_owned_input(a.view({N, 1, C}))
-        .add_owned_input(b.view({N, 1, C}))
-        .build();
-     
-      at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
-          return static_cast<T_ACC>(x) * a + b;
-          });
-      */
-     
-    //const int TPB = 512;
-    const int LOOP_I = 8;
-    //printf("starting elem kernel N: %d H %d W %d C %d G %d TPB %d f %d\n", N, H, W, C, G, TPB, f);
-    if (C % 8 == 0)
-      scale_shift_elem_kernelV<T, LOOP_I, 8><<<dim3(N * H * W * C / TPB / LOOP_I / f / 8, f), TPB>>>(
-          X_data,
-          a_data, b_data,
-          N, C,
-          Y_data
-          );
-    else if (C % 4 == 0)
-      scale_shift_elem_kernelV<T, LOOP_I, 4><<<dim3(N * H * W * C / TPB / LOOP_I / f / 4, f), TPB>>>(X_data, a_data, b_data, N, C, Y_data);
-    else if (C % 2 == 0)
-      scale_shift_elem_kernelV<T, LOOP_I, 2><<<dim3(N * H * W * C / TPB / LOOP_I / f / 2, f), TPB>>>(X_data, a_data, b_data, N, C, Y_data);
-    else
-      scale_shift_elem_kernelV<T, LOOP_I, 1><<<dim3(N * H * W * C / TPB / LOOP_I / f / 1, f), TPB>>>(X_data, a_data, b_data, N, C, Y_data);
+    if constexpr (vec_elems == 1)
+      y_vec[idx] = {ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x)};
+    else if constexpr (vec_elems == 2) {
+      T y_x, y_y;
+      y_x = ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x);
+      y_y = ACT((static_cast<T_ACC>(tmp_X.y) - mean) * rstd * weight_tmp.y + bias_tmp.y);
+      y_vec[idx] = {y_x, y_y};
+    }
+    else if constexpr (vec_elems == 4) {
+      T y_x, y_y, y_z, y_w;
+      y_x = ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x);
+      y_y = ACT((static_cast<T_ACC>(tmp_X.y) - mean) * rstd * weight_tmp.y + bias_tmp.y);
+      y_z = ACT((static_cast<T_ACC>(tmp_X.z) - mean) * rstd * weight_tmp.z + bias_tmp.z);
+      y_w = ACT((static_cast<T_ACC>(tmp_X.w) - mean) * rstd * weight_tmp.w + bias_tmp.w);
+      y_vec[idx] = {y_x, y_y, y_z, y_w};
+    }
+    else if constexpr (vec_elems == 8) {
+      T y_x, y_y, y_z, y_w, y_a, y_b, y_c, y_d;
+      y_x = ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x);
+      y_y = ACT((static_cast<T_ACC>(tmp_X.y) - mean) * rstd * weight_tmp.y + bias_tmp.y);
+      y_z = ACT((static_cast<T_ACC>(tmp_X.z) - mean) * rstd * weight_tmp.z + bias_tmp.z);
+      y_w = ACT((static_cast<T_ACC>(tmp_X.w) - mean) * rstd * weight_tmp.w + bias_tmp.w);
+      y_a = ACT((static_cast<T_ACC>(tmp_X.a) - mean) * rstd * weight_tmp.a + bias_tmp.a);
+      y_b = ACT((static_cast<T_ACC>(tmp_X.b) - mean) * rstd * weight_tmp.b + bias_tmp.b);
+      y_c = ACT((static_cast<T_ACC>(tmp_X.c) - mean) * rstd * weight_tmp.c + bias_tmp.c);
+      y_d = ACT((static_cast<T_ACC>(tmp_X.d) - mean) * rstd * weight_tmp.d + bias_tmp.d);
+      y_vec[idx] = {y_x, y_y, y_z, y_w, y_a, y_b, y_c, y_d};
+    }
   }
-  else { // if spatial resolution small, overhead of creating the extra kernel isn't worth it
-    //printf("starting elem kernel N: %d H %d W %d C %d G %d\n", N, H, W, C, G);
-    /*
-    const int D = C / G;
-     at::TensorIterator iter = at::TensorIteratorConfig()
-        .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC
-        .resize_outputs(false)
-        .add_owned_output(Y.view({N, H * W, G, D}))
-        .add_owned_input(X.view({N, H * W, G, D}))
-        .add_owned_input(means.view({N, 1, G, 1}))
-        .add_owned_input(rstds.view({N, 1, G, 1}))
-        .add_owned_input(weight.view({1, 1, G, D}))
-        .add_owned_input(bias.view({1, 1, G, D}))
-        .build();
-      
-      at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T weight, T bias) -> T {
-          return (static_cast<T_ACC>(x) - mean) * rstd * weight + bias;
-          });
-      */
-                                                                  
-    const T* weight_data = weight.const_data_ptr<T>();
-    const T* bias_data = bias.const_data_ptr<T>();
-
-    //const int TPB = 128;
-    const int LOOP_I = 4;
-    const int D = C / G;
-    if (D % 8 == 0)
-      small_scale_shift_elem_kernelV<T, LOOP_I, 8><<<dim3(N * H * W * C / TPB / LOOP_I / 8 / f, f), TPB>>>(
-          X_data,
-          mean_data, rstd_data,
-          weight_data, bias_data,
-          N, C, G,
-          Y_data
-          );
-    else if (D % 4 == 0)
-      small_scale_shift_elem_kernelV<T, LOOP_I, 4><<<dim3(N * H * W * C / TPB / LOOP_I / f / 4, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
-    else if (D % 2 == 0)
-      small_scale_shift_elem_kernelV<T, LOOP_I, 2><<<dim3(N * H * W * C / TPB / LOOP_I / f / 2, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
-    else
-      small_scale_shift_elem_kernelV<T, LOOP_I, 1><<<dim3(N * H * W * C / TPB / LOOP_I / f / 1, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
-  }
-
-  AT_CUDA_CHECK(cudaGetLastError());
 }
-
+*/
 
 // copied from https://github.com/pytorch/pytorch/blob/b8307513e57f8beaf99daff342a23d705a417e11/aten/src/ATen/native/SharedReduceOps.h
 template <typename scalar_t, typename index_t>
@@ -517,19 +470,30 @@ NH_compute_stats_pt1(
   vals_reduced[idx] = val;
   __syncthreads();
 
-  //for (int stride = TPB / 2; stride >= gf; stride >>= 1) {
-  //  if (tid < stride)
-  //    vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
-  //  __syncthreads();
-  //  }
+  if (C > TPB) {
+    int s;
+    for (s = TPB; (s + TPB) < (C / f); s += TPB)
+      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + s]);
+    if (tid < (C / f) % TPB)
+      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + s]);
+    __syncthreads();
+  }
 
-  if (tid < gf)
-    for (int di = 1; di < d*D; ++di)
-      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + di*gf]);
-  __syncthreads();
+
+  int p = TPB / gf;
+  for (int stride = TPB / 2; stride >= gf && p % 2 == 0; stride >>= 1) {
+    if (tid < stride)
+      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
+    p /= 2;
+    __syncthreads();
+    }
 
   // put reduced outputs into return buffers
   if (tid < gf) {
+    //for (int di = 1; di < d*D; ++di)
+    for (int di = 1; di < p; ++di)
+      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + di*gf]);
+
     int out_idx = 0;
     out_idx += blockIdx.x * G * H; // dim 0, HG stride
     out_idx += blockIdx.z * gf * H; // dim 2, G/f stride
@@ -573,14 +537,17 @@ NH_compute_stats_pt2(
   vals_reduced[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
   __syncthreads();
 
-  for (int stride = TPB / 2; stride >= 1; stride >>= 1) {
-    if (tid < stride)
+  int start_stride = 1 << (int)(ceil(log2(TPB)) - 1);
+  //for (int stride = TPB / 2; stride >= 1; stride >>= 1) {
+  for (int stride = start_stride; stride >= 1; stride >>= 1) {
+    if (tid < stride && tid + stride < H)
+    //if (tid < stride)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
     __syncthreads();
     }
 
   // put reduced outputs into return buffers
-  if (tid < 1) {
+  if (tid == 0) {
     T_ACC m1, m2;
     thrust::tie(m2, m1) = welford_op.project(vals_reduced[tid]);
     int out_idx = 0;
@@ -590,6 +557,8 @@ NH_compute_stats_pt2(
     rstds[out_idx] = rsqrt(m2 + static_cast<T_ACC>(eps));
   }
 }
+
+#define TENSORIT 0
 
 template <typename T>
 void NH_gn_fwd(
@@ -610,7 +579,8 @@ void NH_gn_fwd(
   const int W = X.size(2);
   const int C = X.size(3);
 
-  using WelfordType = WelfordData<at::acc_type<T, true>, int>;
+  using T_ACC = at::acc_type<T, true>;
+  using WelfordType = WelfordData<T_ACC, int>;
   at::Tensor welford_tensor = at::empty({N, G, H, sizeof(WelfordType)}, X.options().dtype(at::kByte));
   WelfordType *welford_data = reinterpret_cast<WelfordType *>(welford_tensor.mutable_data_ptr());
   
@@ -619,17 +589,17 @@ void NH_gn_fwd(
   if (C < MAX_THREADS_PER_BLOCK)
     TPB -= TPB % C;
   else {
-    int d = 1;
-    while (C % d != 0 || C / d > MAX_THREADS_PER_BLOCK)
-      d++;
-    TPB = C / d;
+    int f = 1;
+    while (C % f != 0 || C / f > MAX_THREADS_PER_BLOCK || G % f != 0) {
+      f++;
+    }
+    TPB = C / f;
   }
 
 
   blockDimX = MIN(TPB, C);
   blockDimY = TPB / blockDimX;
   f = MAX(C / TPB, 1); // note: impossible for f > 1 AND blockDimY > 1
-  //printf("starting compute_stats_pt1 N: %d H %d W %d C %d G %d TPB %d bdx %d bdy %d f %d\n", N, H, W, C, G, TPB, blockDimX, blockDimY, f);
   NH_compute_stats_pt1<<<dim3(N, H, f), dim3(blockDimX, blockDimY)>>>(
       X_data, H, W, C, G, 
       welford_data
@@ -645,7 +615,120 @@ void NH_gn_fwd(
           mean_data, rstd_data
     );
 
-  scale_shift<T>(X, weight, bias, G, Y, means, rstds);
+  //  scale_shift<T>(X, weight, bias, G, Y, means, rstds);
+  T* Y_data = Y.mutable_data_ptr<T>();
+
+  if (H * W >= 1024) { // add fused scale-bias kernel to reduce num math ops on each element in the elementwise kernel if the spatial resolution is large
+  //if (false) { // add fused scale-bias kernel to reduce num math ops on each element in the elementwise kernel if the spatial resolution is large
+    const T* weight_data = weight.const_data_ptr<T>();
+    const T* bias_data = bias.const_data_ptr<T>();
+
+    const at::ScalarType kAccType =
+        (X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16)
+        ? at::kFloat
+        : X.scalar_type();
+
+    at::Tensor a = at::empty({N, C}, X.options().dtype(kAccType));
+    at::Tensor b = at::empty({N, C}, X.options().dtype(kAccType));
+    T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
+    T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
+
+    //compute_scale_biases<<<N, C>>>( // note: max(D, T) threads per block
+    TPB = MIN(MAX_THREADS_PER_BLOCK, C);
+    if (C < MAX_THREADS_PER_BLOCK)
+      TPB -= TPB % C;
+    else {
+      int f = 1;
+      while (C % f != 0 || C / f > MAX_THREADS_PER_BLOCK || G % f != 0) {
+        f++;
+      }
+      TPB = C / f;
+    }
+    compute_scale_biases<<<dim3(N, f), TPB>>>( // note: max(D, T) threads per block
+        mean_data, rstd_data,
+        weight_data, bias_data,
+        G, C,
+        a_data, b_data);
+
+    const int LOOP_I = 8;
+    if (!TENSORIT && H * W * C % (C * LOOP_I) == 0) { // the modulus is somewhat arbitrary but ensures that the input is normal enough for the kernel to process correctly
+      if (C % 8 == 0)
+        scale_shift_elem_kernelV<T, LOOP_I, 8><<<dim3(N * H * W * C / TPB / LOOP_I / f / 8, f), TPB>>>(
+            X_data,
+            a_data, b_data,
+            N, C,
+            Y_data
+            );
+      else if (C % 4 == 0)
+        scale_shift_elem_kernelV<T, LOOP_I, 4><<<dim3(N * H * W * C / TPB / LOOP_I / f / 4, f), TPB>>>(X_data, a_data, b_data, N, C, Y_data);
+      else if (C % 2 == 0)
+        scale_shift_elem_kernelV<T, LOOP_I, 2><<<dim3(N * H * W * C / TPB / LOOP_I / f / 2, f), TPB>>>(X_data, a_data, b_data, N, C, Y_data);
+      else
+        scale_shift_elem_kernelV<T, LOOP_I, 1><<<dim3(N * H * W * C / TPB / LOOP_I / f / 1, f), TPB>>>(X_data, a_data, b_data, N, C, Y_data);
+    }
+    else { 
+      printf("using TensorIterator, N: %d H %d W %d C %d G %d TPB %d f %d\n", N, H, W, C, G, TPB, f);
+      at::TensorIterator iter = at::TensorIteratorConfig()
+        .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC
+        .resize_outputs(false)
+        .add_owned_output(Y.view({N, H * W, C}))
+        .add_owned_input(X.view({N, H * W, C}))
+        .add_owned_input(a.view({N, 1, C}))
+        .add_owned_input(b.view({N, 1, C}))
+        .build();
+     
+      at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
+        return static_cast<T_ACC>(x) * a + b;
+      });
+    }
+  }
+  else { // if spatial resolution small, overhead of creating the extra kernel isn't worth it
+    const int D = C / G;
+    const int LOOP_I = 4;
+    if (!TENSORIT && H * W * C % (C * LOOP_I) == 0) { // the modulus is somewhat arbitrary but ensures that the input is normal enough for the kernel to process correctly
+      const T* weight_data = weight.const_data_ptr<T>();
+      const T* bias_data = bias.const_data_ptr<T>();
+
+      int vec_elems;
+      if (D % 8 == 0) vec_elems = 8;
+      else if (D % 4 == 0) vec_elems = 4;
+      else if (D % 2 == 0) vec_elems = 2;
+      else vec_elems = 1;
+
+      //printf("starting elem kernel N: %d H %d W %d C %d G %d vecelems %d TPB %d\n", N, H, W, C, G, vec_elems, TPB);
+      if (vec_elems == 8)
+        small_scale_shift_elem_kernelV<T, LOOP_I, 8><<<dim3(N * H * W * C / TPB / LOOP_I / f / vec_elems, f), TPB>>>(
+            X_data,
+            mean_data, rstd_data,
+            weight_data, bias_data,
+            N, C, G,
+            Y_data
+            );
+      else if (vec_elems == 4)
+        small_scale_shift_elem_kernelV<T, LOOP_I, 4><<<dim3(N * H * W * C / TPB / LOOP_I / f / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 2)
+        small_scale_shift_elem_kernelV<T, LOOP_I, 2><<<dim3(N * H * W * C / TPB / LOOP_I / f / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else
+        small_scale_shift_elem_kernelV<T, LOOP_I, 1><<<dim3(N * H * W * C / TPB / LOOP_I / f / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+    }
+    else {
+      printf("using TensorIterator, N: %d H %d W %d C %d G %d TPB %d f %d\n", N, H, W, C, G, TPB, f);
+      at::TensorIterator iter = at::TensorIteratorConfig()
+        .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC
+        .resize_outputs(false)
+        .add_owned_output(Y.view({N, H * W, G, D}))
+        .add_owned_input(X.view({N, H * W, G, D}))
+        .add_owned_input(means.view({N, 1, G, 1}))
+        .add_owned_input(rstds.view({N, 1, G, 1}))
+        .add_owned_input(weight.view({1, 1, G, D}))
+        .add_owned_input(bias.view({1, 1, G, D}))
+        .build();
+       
+      at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T weight, T bias) -> T {
+        return (static_cast<T_ACC>(x) - mean) * rstd * weight + bias;
+      });
+    }
+  }
   AT_CUDA_CHECK(cudaGetLastError());
 }
 

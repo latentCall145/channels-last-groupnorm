@@ -106,80 +106,103 @@ class GN_NCHW(nn.GroupNorm):
             return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
 
 if __name__ == '__main__':
-    DTYPE = torch.float
     DTYPE = torch.double
+    DTYPE = torch.float
     DTYPE = torch.bfloat16
     print('DTYPE:', DTYPE)
     MODE = 'check' # can be 'check', 'bench', other modes do both
-    CHECK_PROF = False
+    CHECK_PROF = True
 
     if MODE != 'bench':
-        #for DTYPE in (torch.bfloat16, torch.float, torch.double):
-        #    for C in (32, 64, 128, 256, 512):
-        #        for R in (8, 16, 64, 256, 512):
-        #            for B in (1, 2, 4, 8, 16):
-        #                dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
-        #                estimated_mem_usage_gib = 2 * (4.5 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
-        #                if estimated_mem_usage_gib > 4: # vram filter
-        #                    continue
-        #                torch.cuda.empty_cache()
-        B = 2
-        #C = 64
-        #R = 256
-        C = 1280
-        R = 64
-        G = 32
-        print(f'B: {B}, C: {C}, R: {R}, G: {G}, DTYPE: {DTYPE}')
-        #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
-        x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True)
-        #torch.random.manual_seed(0)
+        #DTYPEs = (torch.bfloat16, torch.float, torch.double)
+        #Bs = (1, 2, 4, 8, 16)
+        #Rs = (8, 16, 64, 256, 512)
+        #Cs = (32, 64, 128, 256, 512)
+        #itertools.product(DTYPEs, Bs, Rs, Cs)
 
-        gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
-        #gn1 = GN_NCHW(G, C).cuda().to(DTYPE)
-        gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
+        for B, R, C, G in (
+            (1, 64, 960, 32),
+            (1, 64, 640, 32),
+            (1, 32, 1920, 32),
+            (2, 32, 1280, 32),
+            (1, 64, 320, 32),
+            (1, 32, 960, 32),
+            (1, 16, 2560, 32),
+            (1, 32, 640, 32),
+            (1, 16, 1920, 32),
+            (1, 16, 1280, 32),
+            (1, 32, 320, 32),
+            (1, 8, 2560, 32),
+            (1, 16, 640, 32),
+            (1, 8, 1280, 32),
+            (1, 64, 256, 32),
 
-        if CHECK_PROF:
-            g1 = gn1(x.contiguous())
-            g2 = gn2(x)
-            g1sum = g1.sum()
-            g2sum = g2.sum()
-            g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
-            g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
-        else:
-            with torch.no_grad():
-                w = torch.randn((C,))
-                b = torch.randn((C,))
-                gn1.weight.copy_(w)
-                gn1.bias.copy_(b)
-                gn2.weight.copy_(w)
-                gn2.bias.copy_(b)
-            g1 = gn1(x.contiguous())
-            g2 = gn2(x)
-            rand_dy = torch.rand_like(g2)
-            g1sum = (g1 * rand_dy).sum()
-            g2sum = (g2 * rand_dy).sum()
+            #(2, 64, 256, 32),
+            #(13, 65, 961, 31),
+            #(2, 65, 128, 32),
+            #(13, 67, 961, 31),
+            #(1, 3, 6, 2),
+        ):
+            dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
+            estimated_mem_usage_gib = 2 * (4.5 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
+            if estimated_mem_usage_gib > 4: # vram filter
+                continue
+            torch.cuda.empty_cache()
+            print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
+            #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
+            x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) * 1000
+            #x = torch.zeros((B, R, R, C), dtype=DTYPE, device='cuda').permute(0, 3, 1, 2)
+            #torch.random.manual_seed(0)
 
-            #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
-            #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
-            #g1_grad_wrt_w = g1_grad_wrt_w.reshape((gn1.weight.numel(),))
-            #g2_grad_wrt_w = g2_grad_wrt_w.reshape((gn2.weight.numel(),))
+            gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
+            #gn1 = GN_NCHW(G, C).cuda().to(DTYPE)
+            gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
 
-            #g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
-            #g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
+            if CHECK_PROF:
+                #g1 = gn1(x.contiguous())
+                g2 = gn2(x)
+                #g1sum = g1.sum()
+                #g2sum = g2.sum()
+                #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
+                #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
+            else:
+                with torch.no_grad():
+                    w = torch.randn((C,)) * 1000
+                    b = torch.randn((C,)) * 1000
+                    gn1.weight.copy_(w)
+                    gn1.bias.copy_(b)
+                    gn2.weight.copy_(w)
+                    gn2.bias.copy_(b)
+                g1 = gn1(x.contiguous())
+                g2 = gn2(x)
+                rand_dy = torch.rand_like(g2)
+                g1sum = (g1 * rand_dy).sum()
+                g2sum = (g2 * rand_dy).sum()
 
-            #g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-            #g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+                #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
+                #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
+                #g1_grad_wrt_w = g1_grad_wrt_w.reshape((gn1.weight.numel(),))
+                #g2_grad_wrt_w = g2_grad_wrt_w.reshape((gn2.weight.numel(),))
 
-            print('  FORWARD')
-            print('   ', g1 - g2)
-            print('   ', (g1 - g2).abs().mean())
-            #print('  BACKWARD')
-            #print('    g1 sum wrt w')
-            #print('     ', g1_grad_wrt_w - g2_grad_wrt_w)
-            #print('    g1 sum wrt b')
-            #print('     ', g1_grad_wrt_b - g2_grad_wrt_b)
-            #print('    g1 sum wrt x')
-            #print('     ', g1_grad_wrt_x-g2_grad_wrt_x)
+                #g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
+                #g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
+
+                #g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+                #g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+
+                print('  FORWARD')
+                if (g1 - g2).pow(2).mean() > 1e-5:
+                    print('   ', g1 - g2)
+                    print('   ', (g1 - g2).pow(2).mean())
+                    #print('  BACKWARD')
+                    #print('    g1 sum wrt w')
+                    #print('     ', g1_grad_wrt_w - g2_grad_wrt_w)
+                    #print('    g1 sum wrt b')
+                    #print('     ', g1_grad_wrt_b - g2_grad_wrt_b)
+                    #print('    g1 sum wrt x')
+                    #print('     ', g1_grad_wrt_x-g2_grad_wrt_x)
+                else:
+                    print('    No difference found')
 
     if MODE != 'check':
         NSEC = 1 # number of seconds that each kernel runs for on a certain input
