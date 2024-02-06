@@ -12,7 +12,7 @@ gn_op = load(
             #os.path.join(module_dir, "N_grid_gn_kernel.cu"),
             os.path.join(module_dir, "NH_grid_gn_kernel.cu"),
             #os.path.join(module_dir, "NG_grid_gn_kernel.cu"),
-            #os.path.join(module_dir, "fully_fused_gn_kernel.cu"),
+            os.path.join(module_dir, "fully_fused_gn_kernel.cu"),
             os.path.join(module_dir, "bwd_gn_kernel.cu"),
             #os.path.join(module_dir, "nchw_kernel.cu")
             ],
@@ -35,10 +35,12 @@ class GN_NHWC_Func(torch.autograd.Function):
         #return gn_op.fwd_NG_grid
         return gn_op.fwd_NH_grid
         #return gn_op.fwd_N_grid
-        #if X.shape[0] <= 8: # and X.shape[2] * X.shape[3] >= 128 * 128: # and weight.dtype in (torch.bfloat16, torch.half):
+        #if X.shape[1] / G * X.shape[2] * X.shape[3] <= 4096: # and weight.dtype in (torch.bfloat16, torch.half):
         #    return gn_op.fwd_NH_grid
+        #    return gn_op.fwd_fused
         #else:
-        #    return gn_op.fwd_N_grid
+        #    #return gn_op.fwd_N_grid
+        #    return gn_op.fwd_NH_grid
 
     @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
@@ -121,23 +123,26 @@ if __name__ == '__main__':
         #itertools.product(DTYPEs, Bs, Rs, Cs)
 
         for B, R, C, G in (
-            (1, 64, 960, 32),
-            (1, 64, 640, 32),
-            (1, 32, 1920, 32),
-            (2, 32, 1280, 32),
-            (1, 64, 320, 32),
-            (1, 32, 960, 32),
-            (1, 16, 2560, 32),
-            (1, 32, 640, 32),
-            (1, 16, 1920, 32),
-            (1, 16, 1280, 32),
-            (1, 32, 320, 32),
-            (1, 8, 2560, 32),
-            (1, 16, 640, 32),
-            (1, 8, 1280, 32),
-            (1, 64, 256, 32),
+            (16, 16, 512, 32),
+            #(1, 64, 960, 32),
+            #(1, 64, 640, 32),
+            #(1, 64, 256, 32),
+            #(1, 32, 1920, 32),
+            #(2, 32, 1280, 32),
+            #(1, 64, 320, 32),
+            #(1, 32, 960, 32),
+            #(1, 16, 2560, 32),
+            #(1, 32, 640, 32),
+            #(1, 16, 1920, 32),
+            #(1, 16, 1280, 32),
+            #(1, 32, 320, 32),
+            #(1, 8, 2560, 32),
+            #(1, 16, 640, 32),
+            #(1, 8, 1280, 32),
 
-            #(2, 64, 256, 32),
+            #(1, 64, 512, 32),
+            #(1, 64, 256, 32),
+            #(2, 64, 128, 32),
             #(13, 65, 961, 31),
             #(2, 65, 128, 32),
             #(13, 67, 961, 31),
@@ -150,12 +155,10 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()
             print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
             #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
-            x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) * 1000
+            x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 1000
             #x = torch.zeros((B, R, R, C), dtype=DTYPE, device='cuda').permute(0, 3, 1, 2)
-            #torch.random.manual_seed(0)
+            torch.random.manual_seed(0)
 
-            gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
-            #gn1 = GN_NCHW(G, C).cuda().to(DTYPE)
             gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
 
             if CHECK_PROF:
@@ -166,9 +169,10 @@ if __name__ == '__main__':
                 #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
                 #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
             else:
+                gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
                 with torch.no_grad():
-                    w = torch.randn((C,)) * 1000
-                    b = torch.randn((C,)) * 1000
+                    w = torch.randn((C,)) #* 1000
+                    b = torch.randn((C,)) #* 1000
                     gn1.weight.copy_(w)
                     gn1.bias.copy_(b)
                     gn2.weight.copy_(w)
@@ -194,6 +198,10 @@ if __name__ == '__main__':
                 if (g1 - g2).pow(2).mean() > 1e-5:
                     print('   ', g1 - g2)
                     print('   ', (g1 - g2).pow(2).mean())
+                    #print('   ', (g1 - g2)[:, :8].pow(2).mean())
+                    #for c in range(C):
+                    #    if (g1 - g2)[:, c].pow(2).mean() < 1e-5:
+                    #        print('   ', c)
                     #print('  BACKWARD')
                     #print('    g1 sum wrt w')
                     #print('     ', g1_grad_wrt_w - g2_grad_wrt_w)

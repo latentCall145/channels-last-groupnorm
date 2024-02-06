@@ -1,20 +1,19 @@
+#include <ATen/native/cuda/Loops.cuh>
+#include <ATen/cuda/Exceptions.h> // AT_CUDA_CHECK
 #include <ATen/AccumulateType.h> // acc_type
 #include <ATen/ops/empty_like.h>
+#include <ATen/OpMathType.h> // opmath_t
+#include <ATen/ops/empty.h>
 #include <ATen/Dispatch.h> // at_dispatch macro
+#include <ATen/Tensor.h> // torch tensor
+#include <c10/cuda/CUDAMathCompat.h> // rsqrt
 #include <c10/core/ScalarType.h>
 #include <thrust/pair.h> // thrust::pair
 #include <vector> // std::vector
+#include "Welford.h"
 #define MAX_THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 #define MAX(a, b) (a > b) ? a : b
 #define MIN(a, b) (a < b) ? a : b
-
-#include <ATen/AccumulateType.h> // acc_type
-#include <ATen/ops/empty.h>
-#include <ATen/Tensor.h> // torch tensor
-#include <c10/cuda/CUDAMathCompat.h> // rsqrt
-#include <ATen/cuda/Exceptions.h> // AT_CUDA_CHECK
-# include <ATen/OpMathType.h> // opmath_t
-#include <ATen/native/cuda/Loops.cuh>
 
 template <typename T>
 __global__ void
@@ -87,10 +86,6 @@ template <typename T>
 struct alignas(4 * sizeof(T)) float_vec<T, 4> {
   T x, y, z, w;
 };
-template <typename T>
-struct alignas(8 * sizeof(T)) float_vec<T, 8> {
-  T x, y, z, w, a, b, c, d;
-};
 
 #define ACT // silu
 
@@ -145,18 +140,6 @@ scale_shift_elem_kernelV(
       y_z = ACT(tmp_a.z * tmp_X.z + tmp_b.z);
       y_w = ACT(tmp_a.w * tmp_X.w + tmp_b.w);
       y_vec[idx] = {y_x, y_y, y_z, y_w};
-    }
-    else if constexpr (vec_elems == 8) {
-      T y_x, y_y, y_z, y_w, y_a, y_b, y_c, y_d;
-      y_x = ACT(tmp_a.x * tmp_X.x + tmp_b.x);
-      y_y = ACT(tmp_a.y * tmp_X.y + tmp_b.y);
-      y_z = ACT(tmp_a.z * tmp_X.z + tmp_b.z);
-      y_w = ACT(tmp_a.w * tmp_X.w + tmp_b.w);
-      y_a = ACT(tmp_a.a * tmp_X.a + tmp_b.a);
-      y_b = ACT(tmp_a.b * tmp_X.b + tmp_b.b);
-      y_c = ACT(tmp_a.c * tmp_X.c + tmp_b.c);
-      y_d = ACT(tmp_a.d * tmp_X.d + tmp_b.d);
-      y_vec[idx] = {y_x, y_y, y_z, y_w, y_a, y_b, y_c, y_d};
     }
   }
 }
@@ -213,18 +196,6 @@ small_scale_shift_elem_kernelV(
       y_z = ACT((static_cast<T_ACC>(tmp_X.z) - mean) * rstd * weight_tmp.z + bias_tmp.z);
       y_w = ACT((static_cast<T_ACC>(tmp_X.w) - mean) * rstd * weight_tmp.w + bias_tmp.w);
       y_vec[idx] = {y_x, y_y, y_z, y_w};
-    }
-    else if constexpr (vec_elems == 8) {
-      T y_x, y_y, y_z, y_w, y_a, y_b, y_c, y_d;
-      y_x = ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x);
-      y_y = ACT((static_cast<T_ACC>(tmp_X.y) - mean) * rstd * weight_tmp.y + bias_tmp.y);
-      y_z = ACT((static_cast<T_ACC>(tmp_X.z) - mean) * rstd * weight_tmp.z + bias_tmp.z);
-      y_w = ACT((static_cast<T_ACC>(tmp_X.w) - mean) * rstd * weight_tmp.w + bias_tmp.w);
-      y_a = ACT((static_cast<T_ACC>(tmp_X.a) - mean) * rstd * weight_tmp.a + bias_tmp.a);
-      y_b = ACT((static_cast<T_ACC>(tmp_X.b) - mean) * rstd * weight_tmp.b + bias_tmp.b);
-      y_c = ACT((static_cast<T_ACC>(tmp_X.c) - mean) * rstd * weight_tmp.c + bias_tmp.c);
-      y_d = ACT((static_cast<T_ACC>(tmp_X.d) - mean) * rstd * weight_tmp.d + bias_tmp.d);
-      y_vec[idx] = {y_x, y_y, y_z, y_w, y_a, y_b, y_c, y_d};
     }
   }
 }
@@ -308,93 +279,6 @@ small_scale_shift_elem_kernelV(
 }
 */
 
-// copied from https://github.com/pytorch/pytorch/blob/b8307513e57f8beaf99daff342a23d705a417e11/aten/src/ATen/native/SharedReduceOps.h
-template <typename scalar_t, typename index_t>
-struct WelfordData {
-  scalar_t mean;
-  scalar_t m2;
-  index_t n;
-  scalar_t nf;
-
-  C10_HOST_DEVICE WelfordData() : mean(0), m2(0), n(0), nf(0) {}
-
-  C10_HOST_DEVICE WelfordData(
-      scalar_t mean,
-      scalar_t m2,
-      index_t n,
-      scalar_t nf)
-      : mean(mean), m2(m2), n(n), nf(nf) {}
-};
-
-// copied from https://github.com/pytorch/pytorch/blob/b8307513e57f8beaf99daff342a23d705a417e11/aten/src/ATen/native/SharedReduceOps.h
-template <typename scalar_t, typename acc_scalar_t, typename index_t, typename res_t>
-struct WelfordOps {
-  acc_scalar_t correction;
-  bool take_sqrt;
-  public:
-    using acc_t = WelfordData<acc_scalar_t, index_t>;
-    inline C10_DEVICE acc_t reduce(acc_t acc, scalar_t data) const {
-      // We accumulate n in index_t to avoid cumulative rounding error, but still
-      // need nf for use in combine where int32 may overflow.
-      index_t new_n = acc.n + 1;
-      acc_scalar_t new_nf = static_cast<acc_scalar_t>(new_n);
-
-      acc_scalar_t delta = data - acc.mean;
-      
-      acc_scalar_t new_mean = acc.mean + delta / new_nf;
-      acc_scalar_t new_delta = data - new_mean;
-      return {
-        new_mean,
-        acc.m2 + delta * new_delta,
-        new_n,
-        new_nf,
-      };
-  }
-  inline C10_DEVICE acc_t combine(acc_t a, acc_t b) const {
-    if (a.nf == 0) {
-      return b;
-    }
-    if (b.nf == 0) {
-      return a;
-    }
-    acc_scalar_t delta = b.mean - a.mean;
-    acc_scalar_t new_count = a.nf + b.nf;
-    acc_scalar_t nb_over_n = b.nf / new_count;
-    return {
-      a.mean + delta * nb_over_n,
-      a.m2 + b.m2 + delta * delta * a.nf * nb_over_n,
-      // setting acc.n as -1 since acc.n might not be able to represent the count
-      // correctly within its range, setting it to -1 to avoid confusion
-      -1,
-      new_count
-    };
-  }
-  inline C10_DEVICE res_t project(acc_t acc) const __ubsan_ignore_float_divide_by_zero__ {
-    const auto mean = static_cast<scalar_t>(acc.mean);
-    const auto divisor = acc.nf > correction ? acc.nf - correction : 0;
-    const auto var = acc.m2 / divisor;
-    res_t results(take_sqrt ? std::sqrt(var) : var, mean);
-    return results;
-  }
-
-  static C10_DEVICE acc_t translate_idx(acc_t acc, int64_t /*base_idx*/) {
-    return acc;
-  }
-
-#if defined(__CUDACC__) || defined(__HIPCC__)
-  inline __device__ acc_t warp_shfl_down(acc_t acc, int offset) const {
-    return {
-      WARP_SHFL_DOWN(acc.mean, offset)
-      , WARP_SHFL_DOWN(acc.m2, offset)
-      , WARP_SHFL_DOWN(acc.n, offset)
-      , WARP_SHFL_DOWN(acc.nf, offset)
-    };
-  }
-#endif
-  C10_HOST_DEVICE WelfordOps(acc_scalar_t correction, bool take_sqrt)
-      : correction(correction), take_sqrt(take_sqrt) {}
-};
-
 template <typename T>
 __global__ void
 NH_compute_stats_pt1(
@@ -463,6 +347,7 @@ NH_compute_stats_pt1(
   const int d_idx = threadIdx.y;
   const int gf_idx = threadIdx.x / D;
   const int D_idx = threadIdx.x % D;
+
   int idx = 0;
   idx += d_idx * D * gf; // dim 0, DG/f stride
   idx += D_idx * gf; // dim 1, G/f stride
@@ -470,36 +355,47 @@ NH_compute_stats_pt1(
   vals_reduced[idx] = val;
   __syncthreads();
 
-  if (C > TPB) {
-    int s;
-    for (s = TPB; (s + TPB) < (C / f); s += TPB)
-      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + s]);
-    if (tid < (C / f) % TPB)
-      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + s]);
-    __syncthreads();
-  }
-
-
-  int p = TPB / gf;
-  for (int stride = TPB / 2; stride >= gf && p % 2 == 0; stride >>= 1) {
+  int reduce_n = d * D;
+  for (int stride = TPB / 2; stride >= gf && reduce_n % 2 == 0; stride >>= 1, reduce_n >>= 1) {
     if (tid < stride)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
-    p /= 2;
     __syncthreads();
     }
+  // (d, G/f, D) -> (G/f, d, D)
+  /*int dD_idx = 0;
+  dD_idx += d_idx * D; // dim 0, DG/f stride
+  dD_idx += D_idx; // dim 1, G/f stride
+  int idx = 0;
+  idx += gf_idx * d * D; // dim 2, 1 stride
+  idx += dD_idx; // dim 2, 1 stride
+
+  vals_reduced[idx] = val;
+  __syncthreads();
+
+  int stride;
+  for (stride = d * D; stride % 2 == 0; stride >>= 1) {
+    const int curr_stride = stride >> 1;
+    if (dD_idx < curr_stride)
+      vals_reduced[idx] = welford_op.combine(vals_reduced[idx], vals_reduced[idx + curr_stride]);
+    __syncthreads();
+    }*/
 
   // put reduced outputs into return buffers
+  //if (dD_idx == 0) {
+  //  for (int di = 1; di < stride; ++di)
+  //    vals_reduced[idx] = welford_op.combine(vals_reduced[idx], vals_reduced[idx + di]);
   if (tid < gf) {
-    //for (int di = 1; di < d*D; ++di)
-    for (int di = 1; di < p; ++di)
+    for (int di = 1; di < reduce_n; ++di)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + di*gf]);
 
     int out_idx = 0;
     out_idx += blockIdx.x * G * H; // dim 0, HG stride
     out_idx += blockIdx.z * gf * H; // dim 2, G/f stride
     out_idx += threadIdx.x * H; // dim 3, 1 stride
+    //out_idx += gf_idx * H; // dim 3, 1 stride
     out_idx += blockIdx.y; // dim 1, G stride
     welford_data[out_idx] = vals_reduced[tid];
+    //welford_data[out_idx] = vals_reduced[idx];
   }
 }
 
@@ -537,11 +433,23 @@ NH_compute_stats_pt2(
   vals_reduced[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
   __syncthreads();
 
-  int start_stride = 1 << (int)(ceil(log2(TPB)) - 1);
-  //for (int stride = TPB / 2; stride >= 1; stride >>= 1) {
-  for (int stride = start_stride; stride >= 1; stride >>= 1) {
-    if (tid < stride && tid + stride < H)
-    //if (tid < stride)
+  // next lowest power of 2 (AKA half of the next highest power of 2) - https://graphics.stanford.edu/%7Eseander/bithacks.html#RoundUpPowerOf2
+  int start_stride = TPB - 1;
+  start_stride |= start_stride >> 1;
+  start_stride |= start_stride >> 2;
+  start_stride |= start_stride >> 4;
+  start_stride |= start_stride >> 8;
+  start_stride |= start_stride >> 16;
+  start_stride = (start_stride + 1) >> 1;
+  //int start_stride = 1 << (int)ceil(log2(TPB) - 1);
+
+  // doing the first iteration outside the loop because of the extra condition regarding inputs with non-power-of-2 heights
+  if (tid < start_stride && tid + start_stride < H)
+    vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + start_stride]);
+  __syncthreads();
+#pragma unroll
+  for (int stride = start_stride >> 1; stride >= 1; stride >>= 1) {
+    if (tid < stride)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
     __syncthreads();
     }
@@ -652,15 +560,13 @@ void NH_gn_fwd(
 
     const int LOOP_I = 8;
     if (!TENSORIT && H * W * C % (C * LOOP_I) == 0) { // the modulus is somewhat arbitrary but ensures that the input is normal enough for the kernel to process correctly
-      if (C % 8 == 0)
-        scale_shift_elem_kernelV<T, LOOP_I, 8><<<dim3(N * H * W * C / TPB / LOOP_I / f / 8, f), TPB>>>(
+      if (C % 4 == 0)
+        scale_shift_elem_kernelV<T, LOOP_I, 4><<<dim3(N * H * W * C / TPB / LOOP_I / f / 4, f), TPB>>>(
             X_data,
             a_data, b_data,
             N, C,
             Y_data
             );
-      else if (C % 4 == 0)
-        scale_shift_elem_kernelV<T, LOOP_I, 4><<<dim3(N * H * W * C / TPB / LOOP_I / f / 4, f), TPB>>>(X_data, a_data, b_data, N, C, Y_data);
       else if (C % 2 == 0)
         scale_shift_elem_kernelV<T, LOOP_I, 2><<<dim3(N * H * W * C / TPB / LOOP_I / f / 2, f), TPB>>>(X_data, a_data, b_data, N, C, Y_data);
       else
@@ -696,16 +602,14 @@ void NH_gn_fwd(
       else vec_elems = 1;
 
       //printf("starting elem kernel N: %d H %d W %d C %d G %d vecelems %d TPB %d\n", N, H, W, C, G, vec_elems, TPB);
-      if (vec_elems == 8)
-        small_scale_shift_elem_kernelV<T, LOOP_I, 8><<<dim3(N * H * W * C / TPB / LOOP_I / f / vec_elems, f), TPB>>>(
+      if (vec_elems == 4)
+        small_scale_shift_elem_kernelV<T, LOOP_I, 4><<<dim3(N * H * W * C / TPB / LOOP_I / f / vec_elems, f), TPB>>>(
             X_data,
             mean_data, rstd_data,
             weight_data, bias_data,
             N, C, G,
             Y_data
             );
-      else if (vec_elems == 4)
-        small_scale_shift_elem_kernelV<T, LOOP_I, 4><<<dim3(N * H * W * C / TPB / LOOP_I / f / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
       else if (vec_elems == 2)
         small_scale_shift_elem_kernelV<T, LOOP_I, 2><<<dim3(N * H * W * C / TPB / LOOP_I / f / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
       else

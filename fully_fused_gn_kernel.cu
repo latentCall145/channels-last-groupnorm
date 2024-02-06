@@ -1,10 +1,16 @@
-#include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
-#include <c10/cuda/CUDAMathCompat.h> // rsqrt
+#include <ATen/native/cuda/Loops.cuh>
 #include <ATen/cuda/Exceptions.h> // AT_CUDA_CHECK
 #include <ATen/AccumulateType.h> // acc_type
+#include <ATen/ops/empty_like.h>
+#include <ATen/OpMathType.h> // opmath_t
+#include <ATen/ops/empty.h>
+#include <ATen/Dispatch.h> // at_dispatch macro
+#include <ATen/Tensor.h> // torch tensor
+#include <c10/cuda/CUDAMathCompat.h> // rsqrt
+#include <c10/core/ScalarType.h>
 #include <thrust/pair.h> // thrust::pair
-#include <torch/torch.h> // torch tensor
 #include <vector> // std::vector
+#include "Welford.h"
 #define THREADS_PER_BLOCK 128 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 
 // Reduces a value across the y-threads of a threadblock
@@ -41,8 +47,8 @@ fused_kernel(
         T* rstds
   ) {
   using T_ACC = at::acc_type<T, true>;
-  using WelfordType = at::native::WelfordData<T_ACC, int>;
-  using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  using WelfordType = WelfordData<T_ACC, int>;
+  using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   // griddim = N, G, blockdim = d, D
 
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
@@ -62,7 +68,7 @@ fused_kernel(
     int reduce_idx = i * THREADS_PER_BLOCK * G + threadIdx.y * D * G + blockIdx.y * D + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
     T x = X[blockIdx.x * HWC + reduce_idx];
     X_shmem[i * blockDim.y * D + threadIdx.y * D + threadIdx.x] = x;
-    val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
+    val = welford_op.reduce(val, static_cast<T_ACC>(x)); // last arg isn't used in src
   }
 
   full_reduce(val, welford_op, vals_reduced);
@@ -90,14 +96,14 @@ fused_kernel(
 
 template <typename T>
 void fused_gn_fwd(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
     T eps,
-    torch::Tensor& Y,
-    torch::Tensor& means,
-    torch::Tensor& rstds) {
+    at::Tensor& Y,
+    at::Tensor& means,
+    at::Tensor& rstds) {
   const T* X_data = X.const_data_ptr<T>();
   T* mean_data = means.mutable_data_ptr<T>();
   T* rstd_data = rstds.mutable_data_ptr<T>();
@@ -127,18 +133,18 @@ void fused_gn_fwd(
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
-std::vector<torch::Tensor> gn_nhwc_cuda_fwd_fused(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
+std::vector<at::Tensor> gn_nhwc_cuda_fwd_fused(
+    const at::Tensor& X,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
     const int G,
     float eps) {
   const int N = X.size(0);
 
-  torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
-  torch::Tensor X_out = torch::empty_like(X_nhwc);
-  torch::Tensor means = torch::empty({N, G}, weight.options());
-  torch::Tensor rstds = torch::empty({N, G}, weight.options());
+  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  at::Tensor X_out = at::empty_like(X_nhwc);
+  at::Tensor means = at::empty({N, G}, weight.options());
+  at::Tensor rstds = at::empty({N, G}, weight.options());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
     at::ScalarType::Half,
