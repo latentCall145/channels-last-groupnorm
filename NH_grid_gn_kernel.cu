@@ -87,7 +87,7 @@ struct alignas(4 * sizeof(T)) float_vec<T, 4> {
   T x, y, z, w;
 };
 
-#define ACT // silu
+#define ACT 
 
 template <typename T, int LOOP_I, int vec_elems>
 __global__ void
@@ -103,7 +103,6 @@ scale_shift_elem_kernelV(
   using V = float_vec<T, vec_elems>;
   using V_ACC = float_vec<T_ACC, vec_elems>;
   const int n = (N * blockIdx.x) / gridDim.x;
-  //const int c = threadIdx.x % (C / vec_elems);
   const int c = (blockIdx.y * blockDim.x + threadIdx.x) % (C / vec_elems);
   const int nc = n * (C / vec_elems) + c;
   const int num_vecs = gridDim.x * gridDim.y * LOOP_I * blockDim.x;
@@ -115,7 +114,6 @@ scale_shift_elem_kernelV(
   for (int i = 0; i < LOOP_I; ++i) {
     int idx = 0;
     idx += blockIdx.x * LOOP_I * gridDim.y * blockDim.x;
-    //idx += i * blockDim.x;
     idx += i * gridDim.y * blockDim.x;
     idx += blockIdx.y * blockDim.x;
     idx += threadIdx.x;
@@ -200,85 +198,6 @@ small_scale_shift_elem_kernelV(
   }
 }
 
-/*
-template <typename T, int LOOP_I, int vec_elems>
-__global__ void
-small_scale_shift_elem_kernelV(
-    const T* X_data,
-    const T* mean_data,
-    const T* rstd_data,
-    const T* weight_data,
-    const T* bias_data,
-    const int N,
-    const int H,
-    const int W,
-    const int C,
-    const int G,
-    T* y
-    ) {
-  using T_ACC = at::acc_type<T, true>;
-  using V = float_vec<T, vec_elems>;
-  const int n = blockIdx.x;
-  const int c = (blockIdx.z * blockDim.x + threadIdx.x) % (C / vec_elems);
-  const int g = (G * c) / (C / vec_elems);
-  const int ng = n * G + g;
-  const V *x_vec = reinterpret_cast<const V*>(X_data);
-  const V *weight_vec = reinterpret_cast<const V*>(weight_data);
-  const V *bias_vec = reinterpret_cast<const V*>(bias_data);
-  V *y_vec = reinterpret_cast<V*>(y);
-  T mean = mean_data[ng];
-  T rstd = rstd_data[ng];
-  V weight_tmp = weight_vec[c];
-  V bias_tmp = bias_vec[c];
-        //(N, ceil((float)HWC/TPB/LOOP_I/f/vec_elems), f), TPB
-
-  const int vecs_per_n = H * W * C / vec_elems;
-  const int n_shift = gridDim.y * LOOP_I * gridDim.z * blockDim.x;
-#pragma unroll LOOP_I
-  for (int i = 0; i < LOOP_I; ++i) {
-    int idx = 0;
-    idx += blockIdx.x * n_shift;
-    idx += blockIdx.y * LOOP_I * gridDim.z * blockDim.x;
-    idx += i * gridDim.z * blockDim.x;
-    idx += blockIdx.z * blockDim.x;
-    idx += threadIdx.x;
-    if ((idx % n_shift) >= vecs_per_n)
-      continue;
-
-    V tmp_X = x_vec[idx];
-
-    if constexpr (vec_elems == 1)
-      y_vec[idx] = {ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x)};
-    else if constexpr (vec_elems == 2) {
-      T y_x, y_y;
-      y_x = ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x);
-      y_y = ACT((static_cast<T_ACC>(tmp_X.y) - mean) * rstd * weight_tmp.y + bias_tmp.y);
-      y_vec[idx] = {y_x, y_y};
-    }
-    else if constexpr (vec_elems == 4) {
-      T y_x, y_y, y_z, y_w;
-      y_x = ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x);
-      y_y = ACT((static_cast<T_ACC>(tmp_X.y) - mean) * rstd * weight_tmp.y + bias_tmp.y);
-      y_z = ACT((static_cast<T_ACC>(tmp_X.z) - mean) * rstd * weight_tmp.z + bias_tmp.z);
-      y_w = ACT((static_cast<T_ACC>(tmp_X.w) - mean) * rstd * weight_tmp.w + bias_tmp.w);
-      y_vec[idx] = {y_x, y_y, y_z, y_w};
-    }
-    else if constexpr (vec_elems == 8) {
-      T y_x, y_y, y_z, y_w, y_a, y_b, y_c, y_d;
-      y_x = ACT((static_cast<T_ACC>(tmp_X.x) - mean) * rstd * weight_tmp.x + bias_tmp.x);
-      y_y = ACT((static_cast<T_ACC>(tmp_X.y) - mean) * rstd * weight_tmp.y + bias_tmp.y);
-      y_z = ACT((static_cast<T_ACC>(tmp_X.z) - mean) * rstd * weight_tmp.z + bias_tmp.z);
-      y_w = ACT((static_cast<T_ACC>(tmp_X.w) - mean) * rstd * weight_tmp.w + bias_tmp.w);
-      y_a = ACT((static_cast<T_ACC>(tmp_X.a) - mean) * rstd * weight_tmp.a + bias_tmp.a);
-      y_b = ACT((static_cast<T_ACC>(tmp_X.b) - mean) * rstd * weight_tmp.b + bias_tmp.b);
-      y_c = ACT((static_cast<T_ACC>(tmp_X.c) - mean) * rstd * weight_tmp.c + bias_tmp.c);
-      y_d = ACT((static_cast<T_ACC>(tmp_X.d) - mean) * rstd * weight_tmp.d + bias_tmp.d);
-      y_vec[idx] = {y_x, y_y, y_z, y_w, y_a, y_b, y_c, y_d};
-    }
-  }
-}
-*/
-
 template <typename T>
 __global__ void
 NH_compute_stats_pt1(
@@ -287,7 +206,7 @@ NH_compute_stats_pt1(
     const int W,
     const int C,
     const int G,
-    WelfordData<at::acc_type<T, true>, int> *welford_data
+    typename std::aligned_storage<4*sizeof(at::acc_type<T, true>), 4*sizeof(at::acc_type<T, true>)>::type *welford_data
   ) {
   /*
      C <= MAX_THREADS_PER_BLOCK (Kernel 1):
@@ -309,6 +228,7 @@ NH_compute_stats_pt1(
   */
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = WelfordData<T_ACC, int>;
+  using WelfordAligned = typename std::aligned_storage<4*sizeof(T_ACC), 4*sizeof(T_ACC)>::type;
   using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   const int TPB = blockDim.y * blockDim.x;
   const int d = blockDim.y;
@@ -321,10 +241,11 @@ NH_compute_stats_pt1(
 
   //const int w = W / d;
   const int w = ceil((float)W / d);
+  int i;
 #pragma unroll 8
-  for (int i = 0; i < w; ++i) {
-    if ((int)(i * d + threadIdx.y) >= W)
-      continue;
+  for (i = 0; i < w - 1; ++i) {
+    //if ((int)(i * d + threadIdx.y) >= W)
+    //  continue;
 
     int reduce_idx = 0;
     reduce_idx += blockIdx.x * H * W * C; // dim 0, HWC stride
@@ -336,7 +257,17 @@ NH_compute_stats_pt1(
     T x = X[reduce_idx];
     val = welford_op.reduce(val, static_cast<T_ACC>(x)); // last arg isn't used in src
   }
-  __syncthreads();
+  if ((int)(i * d + threadIdx.y) < W) { // now i = w-1 and this condition isn't guaranteed to be true
+    int reduce_idx = 0;
+    reduce_idx += blockIdx.x * H * W * C; // dim 0, HWC stride
+    reduce_idx += blockIdx.y * W * C; // dim 1, WC stride
+    reduce_idx += i * d * C; // dim 2, dC stride
+    reduce_idx += threadIdx.y * C; // dim 3, C stride
+    reduce_idx += blockIdx.z * TPB; // dim 4, TPB stride (in kernel 1, threadIdx.z is always 0 so this statement does nothing)
+    reduce_idx += threadIdx.x; // dim 5, 1 stride
+    T x = X[reduce_idx];
+    val = welford_op.reduce(val, static_cast<T_ACC>(x)); // last arg isn't used in src
+  }
 
   const int D = C / G;
 
@@ -356,34 +287,13 @@ NH_compute_stats_pt1(
   __syncthreads();
 
   int reduce_n = d * D;
+#pragma unroll 8
   for (int stride = TPB / 2; stride >= gf && reduce_n % 2 == 0; stride >>= 1, reduce_n >>= 1) {
     if (tid < stride)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
     __syncthreads();
     }
-  // (d, G/f, D) -> (G/f, d, D)
-  /*int dD_idx = 0;
-  dD_idx += d_idx * D; // dim 0, DG/f stride
-  dD_idx += D_idx; // dim 1, G/f stride
-  int idx = 0;
-  idx += gf_idx * d * D; // dim 2, 1 stride
-  idx += dD_idx; // dim 2, 1 stride
 
-  vals_reduced[idx] = val;
-  __syncthreads();
-
-  int stride;
-  for (stride = d * D; stride % 2 == 0; stride >>= 1) {
-    const int curr_stride = stride >> 1;
-    if (dD_idx < curr_stride)
-      vals_reduced[idx] = welford_op.combine(vals_reduced[idx], vals_reduced[idx + curr_stride]);
-    __syncthreads();
-    }*/
-
-  // put reduced outputs into return buffers
-  //if (dD_idx == 0) {
-  //  for (int di = 1; di < stride; ++di)
-  //    vals_reduced[idx] = welford_op.combine(vals_reduced[idx], vals_reduced[idx + di]);
   if (tid < gf) {
     for (int di = 1; di < reduce_n; ++di)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + di*gf]);
@@ -392,17 +302,15 @@ NH_compute_stats_pt1(
     out_idx += blockIdx.x * G * H; // dim 0, HG stride
     out_idx += blockIdx.z * gf * H; // dim 2, G/f stride
     out_idx += threadIdx.x * H; // dim 3, 1 stride
-    //out_idx += gf_idx * H; // dim 3, 1 stride
     out_idx += blockIdx.y; // dim 1, G stride
-    welford_data[out_idx] = vals_reduced[tid];
-    //welford_data[out_idx] = vals_reduced[idx];
+    welford_data[out_idx] = reinterpret_cast<WelfordAligned*>(&vals_reduced[tid])[0];
   }
 }
 
 template <typename T>
 __global__ void
 NH_compute_stats_pt2(
-    WelfordData<at::acc_type<T, true>, int> *welford_data,
+    typename std::aligned_storage<4*sizeof(at::acc_type<T, true>), 4*sizeof(at::acc_type<T, true>)>::type *welford_data,
     const int H,
     const int G,
     const float eps,
@@ -412,6 +320,7 @@ NH_compute_stats_pt2(
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = WelfordData<T_ACC, int>;
   using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  using WelfordAligned = typename std::aligned_storage<4*sizeof(T_ACC), 4*sizeof(T_ACC)>::type;
   /*
      griddim: (x=N, y=G); blockdim: (x=H)
       d = num. spatial elements (from H dimension) each thread-block processes in parallel
@@ -428,9 +337,11 @@ NH_compute_stats_pt2(
   // shmem reduction
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[MAX_THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
+  WelfordAligned *vals_reduced_aligned = reinterpret_cast<WelfordAligned*>(vals_reduced_arr);
 
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  vals_reduced[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
+  //vals_reduced[tid] = reinterpret_cast<WelfordType*>(&welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x])[0];
+  vals_reduced_aligned[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
   __syncthreads();
 
   // next lowest power of 2 (AKA half of the next highest power of 2) - https://graphics.stanford.edu/%7Eseander/bithacks.html#RoundUpPowerOf2
@@ -441,7 +352,6 @@ NH_compute_stats_pt2(
   start_stride |= start_stride >> 8;
   start_stride |= start_stride >> 16;
   start_stride = (start_stride + 1) >> 1;
-  //int start_stride = 1 << (int)ceil(log2(TPB) - 1);
 
   // doing the first iteration outside the loop because of the extra condition regarding inputs with non-power-of-2 heights
   if (tid < start_stride && tid + start_stride < H)
@@ -489,8 +399,9 @@ void NH_gn_fwd(
 
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = WelfordData<T_ACC, int>;
+  using WelfordAligned = typename std::aligned_storage<4*sizeof(T_ACC), 4*sizeof(T_ACC)>::type;
   at::Tensor welford_tensor = at::empty({N, G, H, sizeof(WelfordType)}, X.options().dtype(at::kByte));
-  WelfordType *welford_data = reinterpret_cast<WelfordType *>(welford_tensor.mutable_data_ptr());
+  WelfordAligned *welford_data = reinterpret_cast<WelfordAligned *>(welford_tensor.mutable_data_ptr());
   
   int blockDimX, blockDimY, f, TPB;
   TPB = MIN(MAX_THREADS_PER_BLOCK, W * C);
@@ -514,20 +425,15 @@ void NH_gn_fwd(
   );
 
   //printf("starting compute_stats_pt2 N: %d H %d W %d C %d G %d\n", N, H, W, C, G);
-  //TPB = MIN(MAX_THREADS_PER_BLOCK, H * G / f);
-  //blockDimX = MIN(TPB, G / f);
-  //blockDimY = TPB / blockDimX;
   NH_compute_stats_pt2<<<dim3(N, G), H>>>(
           welford_data,
           H, G, eps,
           mean_data, rstd_data
     );
 
-  //  scale_shift<T>(X, weight, bias, G, Y, means, rstds);
   T* Y_data = Y.mutable_data_ptr<T>();
 
   if (H * W >= 1024) { // add fused scale-bias kernel to reduce num math ops on each element in the elementwise kernel if the spatial resolution is large
-  //if (false) { // add fused scale-bias kernel to reduce num math ops on each element in the elementwise kernel if the spatial resolution is large
     const T* weight_data = weight.const_data_ptr<T>();
     const T* bias_data = bias.const_data_ptr<T>();
 
@@ -541,7 +447,6 @@ void NH_gn_fwd(
     T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
     T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
 
-    //compute_scale_biases<<<N, C>>>( // note: max(D, T) threads per block
     TPB = MIN(MAX_THREADS_PER_BLOCK, C);
     if (C < MAX_THREADS_PER_BLOCK)
       TPB -= TPB % C;
@@ -596,8 +501,7 @@ void NH_gn_fwd(
       const T* bias_data = bias.const_data_ptr<T>();
 
       int vec_elems;
-      if (D % 8 == 0) vec_elems = 8;
-      else if (D % 4 == 0) vec_elems = 4;
+      if (D % 4 == 0) vec_elems = 4;
       else if (D % 2 == 0) vec_elems = 2;
       else vec_elems = 1;
 

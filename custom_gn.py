@@ -32,14 +32,12 @@ gn_op = load(
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
     def choose_kernel(X: torch.Tensor, G: int):
-        #return gn_op.fwd_NG_grid
         return gn_op.fwd_NH_grid
-        #return gn_op.fwd_N_grid
-        #if X.shape[1] / G * X.shape[2] * X.shape[3] <= 4096: # and weight.dtype in (torch.bfloat16, torch.half):
-        #    return gn_op.fwd_NH_grid
+        #if X.shape[1] / G * X.shape[2] * X.shape[3] <= 8192: # and weight.dtype in (torch.bfloat16, torch.half):
+        #    #print('fs', X.shape)
         #    return gn_op.fwd_fused
         #else:
-        #    #return gn_op.fwd_N_grid
+        #    #print('NH', X.shape)
         #    return gn_op.fwd_NH_grid
 
     @staticmethod
@@ -123,7 +121,6 @@ if __name__ == '__main__':
         #itertools.product(DTYPEs, Bs, Rs, Cs)
 
         for B, R, C, G in (
-            (16, 16, 512, 32),
             #(1, 64, 960, 32),
             #(1, 64, 640, 32),
             #(1, 64, 256, 32),
@@ -140,6 +137,7 @@ if __name__ == '__main__':
             #(1, 16, 640, 32),
             #(1, 8, 1280, 32),
 
+            (1, 512, 64, 32),
             #(1, 64, 512, 32),
             #(1, 64, 256, 32),
             #(2, 64, 128, 32),
@@ -218,14 +216,15 @@ if __name__ == '__main__':
         CHANNELS = [32, 64, 128, 256, 512]
         RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
         NUM_GROUPS = [4, 8, 16, 32, 64, 128]
+        BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
         GN_KERNELS = [
-                #(GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
+                (GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
                 (GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
                 #(GN_NHWC, 'GN NHWC N grid (custom op)', gn_op.fwd_N_grid),
                 #(GN_NHWC, 'GN NHWC NG grid NG grid (custom op)', gn_op.fwd_NG_grid),
-                (GN_NCHW, 'torch.nn GN NCHW (compiled from src)', gn_op.nchwforward),
+                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', gn_op.nchwforward),
+                (nn.GroupNorm, 'torch.nn GN NCHW', None),
                 #(GN_NHWC, 'GN NHWC', None),
-                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', None)
         ]
 
         os.makedirs('csvs', exist_ok=True)
@@ -241,25 +240,39 @@ if __name__ == '__main__':
 
             return (B, C, R, G) in {
                     (1,  512, 8, 32),
-                    (2,  512, 8, 32),
-                    (4,  512, 8, 32),
-                    (8,  512, 8, 32),
+                    #(2,  512, 8, 32),
+                    #(4,  512, 8, 32),
+                    #(8,  512, 8, 32),
                     (16, 512, 8, 32),
-                    (32, 512, 8, 32),
+                    #(32, 512, 8, 32),
+
+                    (1,  512, 16, 32),
+                    #(2,  512, 16, 32),
+                    #(4,  512, 16, 32),
+                    #(8,  512, 16, 32),
+                    (16, 512, 16, 32),
+                    #(32, 512, 16, 32),
 
                     (1, 64, 256, 16),
-                    (2, 64, 256, 16),
-                    (4, 64, 256, 16),
-                    (8, 64, 256, 16),
+                    #(2, 64, 256, 16),
+                    #(4, 64, 256, 16),
+                    #(8, 64, 256, 16),
                     (16, 64, 256, 16),
-                    (32, 64, 256, 16),
+                    #(32, 64, 256, 16),
 
-                    (1, 128, 64, 16),
-                    (2, 128, 64, 16),
-                    (4, 128, 32, 16),
-                    (8, 128, 32, 16),
-                    (16, 128, 32, 16),
-                    (32, 128, 32, 16),
+                    (1, 64, 512, 16),
+                    #(2, 64, 512, 16),
+                    #(4, 64, 512, 16),
+                    #(8, 64, 512, 16),
+                    (4, 64, 512, 16),
+                    #(32, 64, 512, 16),
+
+                    #(1, 128, 64, 16),
+                    #(2, 128, 64, 16),
+                    #(4, 128, 32, 16),
+                    #(8, 128, 32, 16),
+                    #(16, 128, 32, 16),
+                    #(32, 128, 32, 16),
                     }
 
             dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
@@ -271,16 +284,24 @@ if __name__ == '__main__':
         configs = list(filter(config_filter, itertools.product(BATCHES, CHANNELS, RESOLUTIONS, NUM_GROUPS)))
         print('Estimated time (seconds) to complete:', NSEC * len(configs) * len(GN_KERNELS))
 
+        def red(text):
+            return '\033[91m' + str(text) + '\033[0m'
+        def green(text):
+            return '\033[92m' + str(text) + '\033[0m'
+        def yellow(text):
+            return '\033[93m' + str(text) + '\033[0m'
+        def blue(text):
+            return '\033[94m' + str(text) + '\033[0m'
+
         for B, C, R, G in configs:
             x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
 
             gn_args = (G, C)
-            BENCH = 'bwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
             print(BENCH, 'X shape:', x_nchw.shape, 'G (num groups):', G)
             for gn_class, desc, fwd_fn in GN_KERNELS:
                 gn_input = x_nchw if 'NCHW' in desc else x_nhwc
-                print(desc)
+                print(f'\t{desc}')
 
                 try:
                     gn_layer = gn_class(*gn_args).cuda().to(DTYPE)
@@ -295,7 +316,10 @@ if __name__ == '__main__':
 
                     while time.time() - tic < NSEC:
                         if BENCH == 'fwd':
-                            g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps) # Not calling gn_layer(gn_input) since I found this added a lot of overhead
+                            if fwd_fn is None:
+                                g = gn_layer(gn_input)
+                            else:
+                                g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps) # Not calling gn_layer(gn_input) since I found this added a lot of overhead
                         elif BENCH == 'both':
                             g = gn_layer(gn_input)
                         if BENCH != 'fwd':
@@ -308,7 +332,7 @@ if __name__ == '__main__':
                         if time.time() - tic_sec > 0.1:
                             speed = round(ntrials_minor / (time.time() - tic_sec), 2)
                             minor_speeds.append(speed)
-                            print(f'{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {speed} it/s\r', end='')
+                            print(f'\t\t{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {blue(speed)} it/s\r', end='')
                             ntrials_minor = 0
                             tic_sec = time.time()
 
@@ -316,15 +340,14 @@ if __name__ == '__main__':
                     median_speed = round(np.percentile(minor_speeds, 50), 2)
                     slow_speed = round(np.percentile(minor_speeds, 25), 2)
                     fast_speed = round(np.percentile(minor_speeds, 75), 2)
-                    print(f'\nSpeed (25th/50th/75th percentile): {slow_speed}/{median_speed}/{fast_speed} it/s')
+                    print(f'\n\t\tSpeed (25th/50th/75th percentile): {red(slow_speed)}/{yellow(median_speed)}/{green(fast_speed)} it/s')
                 except KeyboardInterrupt:
                     print(f'Keyboard interrupt, closing {fname}.')
                     outfile.close()
                     raise
                 except Exception as e:
-                    print('Error:', e)
+                    print('\t\tFAILED; Error:', str(e).strip())
                     median_speed = slow_speed = fast_speed = '-1 (failed)'
-                    print(f'FAILED')
                 
                 outfile.write(f'{desc},{B},{C},{R},{G},{C//G},{slow_speed},{median_speed},{fast_speed}\n')
             print()
