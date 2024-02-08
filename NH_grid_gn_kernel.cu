@@ -1,4 +1,3 @@
-//#include <ATen/native/cuda/Loops.cuh>
 //#include <ATen/cuda/Exceptions.h> // AT_CUDA_CHECK
 #include <ATen/AccumulateType.h> // acc_type
 #include <ATen/ops/empty_like.h>
@@ -150,7 +149,7 @@ NH_compute_stats_pt1(
     const int W,
     const int C,
     const int G,
-    typename std::aligned_storage<4*sizeof(at::acc_type<T, true>), 4*sizeof(at::acc_type<T, true>)>::type *welford_data
+    WelfordData<at::acc_type<T, true>, int> *welford_data
   ) {
   /*
      C <= MAX_THREADS_PER_BLOCK (Kernel 1):
@@ -172,7 +171,6 @@ NH_compute_stats_pt1(
   */
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = WelfordData<T_ACC, int>;
-  using WelfordAligned = typename std::aligned_storage<4*sizeof(T_ACC), 4*sizeof(T_ACC)>::type;
   using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
   const int TPB = blockDim.y * blockDim.x;
   const int d = blockDim.y;
@@ -219,8 +217,6 @@ NH_compute_stats_pt1(
 
   int reduce_n = TPB / gf;
 #pragma unroll
-  //for (int stride = TPB / 2; stride >= gf && reduce_n % 2 == 0; stride >>= 1, reduce_n >>= 1) {
-  //for (int stride = TPB / 2; stride >= gf && stride % reduce_n == 0; stride >>= 1, reduce_n >>= 1) {
   for (int stride = TPB / 2; stride >= gf && reduce_n % 2 == 0 && stride % gf == 0; stride >>= 1, reduce_n >>= 1) {
     if (tid < stride)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
@@ -236,14 +232,14 @@ NH_compute_stats_pt1(
     out_idx += blockIdx.z * gf * H; // dim 1, G/f * H stride
     out_idx += tid * H; // dim 2, H stride
     out_idx += blockIdx.y; // dim 3, 1 stride
-    welford_data[out_idx] = *reinterpret_cast<WelfordAligned*>(&vals_reduced[tid]);
+    welford_data[out_idx] = vals_reduced[tid];
   }
 }
 
 template <typename T>
 __global__ void
 NH_compute_stats_pt2(
-    typename std::aligned_storage<4*sizeof(at::acc_type<T, true>), 4*sizeof(at::acc_type<T, true>)>::type *welford_data,
+    WelfordData<at::acc_type<T, true>, int> *welford_data,
     const int H,
     const int G,
     const float eps,
@@ -253,7 +249,6 @@ NH_compute_stats_pt2(
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = WelfordData<T_ACC, int>;
   using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
-  using WelfordAligned = typename std::aligned_storage<4*sizeof(T_ACC), 4*sizeof(T_ACC)>::type;
   /*
      griddim: (x=N, y=G); blockdim: (x=H)
       d = num. spatial elements (from H dimension) each thread-block processes in parallel
@@ -269,10 +264,9 @@ NH_compute_stats_pt2(
   // shmem reduction
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[MAX_THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
-  WelfordAligned *vals_reduced_aligned = reinterpret_cast<WelfordAligned*>(vals_reduced_arr);
 
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  vals_reduced_aligned[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
+  vals_reduced[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
   __syncthreads();
 
   // next lowest power of 2 (AKA half of the next highest power of 2) - https://graphics.stanford.edu/%7Eseander/bithacks.html#RoundUpPowerOf2
@@ -331,9 +325,8 @@ void NH_gn_fwd(
 
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = WelfordData<T_ACC, int>;
-  using WelfordAligned = typename std::aligned_storage<4*sizeof(T_ACC), 4*sizeof(T_ACC)>::type;
   at::Tensor welford_tensor = at::empty({N, G, H, sizeof(WelfordType)}, X.options().dtype(at::kByte));
-  WelfordAligned *welford_data = reinterpret_cast<WelfordAligned *>(welford_tensor.mutable_data_ptr());
+  WelfordType *welford_data = reinterpret_cast<WelfordType*>(welford_tensor.mutable_data_ptr());
   
   int TPB, d = 1, f = 1;
   TPB = MIN(MAX_THREADS_PER_BLOCK, W * C);
@@ -354,10 +347,10 @@ void NH_gn_fwd(
   );
 
   NH_compute_stats_pt2<<<dim3(N, G), H>>>(
-          welford_data,
-          H, G, eps,
-          mean_data, rstd_data
-    );
+      welford_data,
+      H, G, eps,
+      mean_data, rstd_data
+  );
 
   const int LOOP_I = 8;
   const int D = C / G;

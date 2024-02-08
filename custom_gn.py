@@ -109,16 +109,12 @@ if __name__ == '__main__':
 
     if MODE != 'bench':
         #DTYPEs = (torch.bfloat16, torch.float, torch.double)
-        #Bs = (1, 2, 4, 8, 16)
+        #Bs = (2, 2, 4, 8, 16)
         #Rs = (8, 16, 64, 256, 512)
         #Cs = (32, 64, 128, 256, 512)
         #itertools.product(DTYPEs, Bs, Rs, Cs)
 
         for B, R, C, G in (
-            (1, 512, 96, 32),
-            (1, 256, 256, 32),
-            (1, 64, 64, 32),
-            (1, 64, 96, 32),
             (1, 64, 960, 32),
             (1, 64, 640, 32),
             (1, 64, 256, 32),
