@@ -1,11 +1,13 @@
 #include <ATen/AccumulateType.h> // acc_type
+#include <ATen/native/cuda/Loops.cuh>
 #include <ATen/Tensor.h> // at::tensor
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/Dispatch.h> // at_dispatch macro
-#include <ATen/cuda/Exceptions.h> // C10_CUDA_KERNEL_LAUNCH_CHECK
+//#include <ATen/cuda/Exceptions.h> // C10_CUDA_KERNEL_LAUNCH_CHECK
 #include <c10/core/ScalarType.h>
 #include <vector> // std::vector
+#include "vecs.h"
 #define MAX_THREADS_PER_BLOCK 512
 #define MAX(a, b) (a > b) ? a : b
 #define MIN(a, b) (a < b) ? a : b
@@ -15,15 +17,28 @@ __device__ void
 sum_reduce(
     T vals_reduced,
     const int start_stride,
+    //const int size,
     const int end_stride
   ) {
+  //const int TPB = blockDim.y * blockDim.x;
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-#pragma unroll 8
-  for (int stride = start_stride; stride >= end_stride; stride >>= 1) {
+  //int reduce_n = TPB / end_stride;
+  //int reduce_n = size / end_stride;
+  int reduce_n = 2 * start_stride / end_stride;
+
+#pragma unroll
+  for (int stride = start_stride; stride >= end_stride && reduce_n % 2 == 0 && stride % end_stride == 0; stride >>= 1, reduce_n >>= 1) {
+  //for (int stride = start_stride; stride >= end_stride && reduce_n % 2 == 0 && stride % end_stride == 0; stride >>= 1, reduce_n >>= 1) {
     if (tid < stride)
       vals_reduced[tid] += vals_reduced[tid + stride];
     __syncthreads();
   }
+
+  if (tid < end_stride)
+#pragma unroll
+    for (int i = 1; i < reduce_n; ++i)
+      vals_reduced[tid] += vals_reduced[tid + i * end_stride];
+  __syncthreads();
 }
 
 template <typename T>
@@ -59,12 +74,13 @@ spatial_loop(
   using T_ACC = at::acc_type<T, true>;
   const int TPB = blockDim.y * blockDim.x;
   const int d = blockDim.y;
-  const int w = W / d;
   T_ACC xdy_sum = 0;
   T_ACC dy_sum = 0;
 
-#pragma unroll 8
-  for (int i = 0; i < w; ++i) {
+  const int w = ceil((float)W / d);
+  int i;
+#pragma unroll
+  for (i = 0; i < w - 1; ++i) {
     int reduce_idx = 0;
     reduce_idx += blockIdx.x * H * W * C; // dim 0, HWC stride
     reduce_idx += blockIdx.y * W * C; // dim 1, WC stride
@@ -72,6 +88,12 @@ spatial_loop(
     reduce_idx += threadIdx.y * C; // dim 3, C stride
     reduce_idx += blockIdx.z * TPB; // dim 4, TPB stride (in kernel 1, threadIdx.z is always 0 so this statement does nothing)
     reduce_idx += threadIdx.x; // dim 5, 1 stride
+    T_ACC dy_elem = static_cast<T_ACC>(dy_data[reduce_idx]);
+    xdy_sum += dy_elem * X_data[reduce_idx];
+    dy_sum += dy_elem;
+  }
+  if ((int)(i * d + threadIdx.y) < W) { // last iteration to deal with inputs with weird width sizes
+    int reduce_idx = blockIdx.x * H * W * C + blockIdx.y * W * C + i * d * C + threadIdx.y * C + blockIdx.z * TPB + threadIdx.x;
     T_ACC dy_elem = static_cast<T_ACC>(dy_data[reduce_idx]);
     xdy_sum += dy_elem * X_data[reduce_idx];
     dy_sum += dy_elem;
@@ -85,6 +107,7 @@ spatial_loop(
   vals_reduced[2 * tid] = xdy_sum;
   vals_reduced[2 * tid + 1] = dy_sum;
   __syncthreads();
+  //sum_reduce(vals_reduced, 2 * TPB, 2 * C);
   sum_reduce(vals_reduced, TPB, 2 * C);
 
   // put reduced outputs into return buffers
@@ -116,7 +139,7 @@ compute_bwd_scale_biases(
     at::acc_type<T, true>* coef2_data,
     at::acc_type<T, true>* coef3_data) {
   /*
-     griddim: (x=N); blockdim: (x=C)
+     griddim: (x=N, y=f); blockdim: (x=C/f)
       d = num. spatial elements (from HW dimension) each thread-block processes in parallel
       Cd = TPB (threads per block)
      X shape: (N, C) -view-> (N, G, D) -permute-> (N, D, G) -reduce-> (N, G)
@@ -125,8 +148,10 @@ compute_bwd_scale_biases(
    */
   using T_ACC = at::acc_type<T, true>;
   const int D = C / G;
+  const int f = gridDim.y;
+  const int Gf = G / f;
   const int n = blockIdx.x;
-  const int c = threadIdx.x;
+  const int c = blockIdx.y * blockDim.x + threadIdx.x;
   const int g = c / D;
   const int d = c % D;
   const int nc = n * C + c;
@@ -136,12 +161,12 @@ compute_bwd_scale_biases(
   T_ACC *vals_reduced = reinterpret_cast<T_ACC*>(vals_reduced_uncasted);
 
   int idx = 0;
-  idx += d * G;
-  idx += g;
+  idx += d * G / f;
+  idx += g % Gf;
   vals_reduced[2 * idx] = xdy_sum_data[nc] * gamma_v;
   vals_reduced[2 * idx + 1] = dy_sum_data[nc] * gamma_v;
   __syncthreads();
-  sum_reduce(vals_reduced, C, 2 * G);
+  sum_reduce(vals_reduced, C / f, 2 * G / f);
 
   const int ng = n * G + g;
   const T_ACC mean_elem = static_cast<T_ACC>(mean_data[ng]);
@@ -149,8 +174,8 @@ compute_bwd_scale_biases(
   coef1_data[nc] = rstd_elem * weight_data[c];
 
   if (d == 0) {
-    const T_ACC sum1 = vals_reduced[2 * g];
-    const T_ACC sum2 = vals_reduced[2 * g + 1];
+    const T_ACC sum1 = vals_reduced[2 * (g % Gf)];
+    const T_ACC sum2 = vals_reduced[2 * (g % Gf) + 1];
     const T_ACC s = T_ACC(1) / static_cast<T_ACC>(D * H * W);
     const T_ACC x = (sum2 * mean_elem - sum1) * (rstd_elem * rstd_elem * rstd_elem * s);
     coef2_data[ng] = x;
@@ -170,15 +195,15 @@ compute_dweight_dbias(
     const int G,
     T* dweight_data,
     T* dbias_data) {
-  // gridDim: (x=1), blockDim: (x=C)
+  // gridDim: (x=f), blockDim: (x=C / f)
   using T_ACC = at::acc_type<T, true>;
-  const int c = threadIdx.x;
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int D = C / G;
   const int g = c / D;
   T_ACC sum1 = 0;
   T_ACC sum2 = 0;
 
-#pragma unroll 8
+#pragma unroll
   for (int n = 0; n < N; ++n) {
     const int nc = n * C + c;
     const int ng = n * G + g;
@@ -188,42 +213,6 @@ compute_dweight_dbias(
   dweight_data[c] = sum1;
   dbias_data[c] = sum2;
 }
-
-template <typename T, int num_elems>
-struct float_vec;
-
-template <typename T>
-struct alignas(1 * sizeof(T)) float_vec<T, 1> {
-  T x;
-  template <typename U>
-  operator float_vec<U, 1>() const {
-      return { static_cast<U>(x), };
-  }
-};
-template <typename T>
-struct alignas(2 * sizeof(T)) float_vec<T, 2> {
-  T x, y;
-  template <typename U>
-  operator float_vec<U, 2>() const {
-      return { static_cast<U>(x), static_cast<U>(y), };
-  }
-};
-template <typename T>
-struct alignas(4 * sizeof(T)) float_vec<T, 4> {
-  T x, y, z, w;
-  template <typename U>
-  operator float_vec<U, 4>() const {
-      return { static_cast<U>(x), static_cast<U>(y), static_cast<U>(z), static_cast<U>(w), };
-  }
-};
-template <typename T>
-struct alignas(8 * sizeof(T)) float_vec<T, 8> {
-  T x, y, z, w, a, b, c, d;
-  template <typename U>
-  operator float_vec<U, 8>() const {
-      return { static_cast<U>(x), static_cast<U>(y), static_cast<U>(z), static_cast<U>(w), static_cast<U>(a), static_cast<U>(b), static_cast<U>(c), static_cast<U>(d) };
-  }
-};
 
 template <typename T, int LOOP_I, int vec_elems>
 __global__ void
@@ -241,59 +230,49 @@ dx_elem_kernel(
   using T_ACC = at::acc_type<T, true>;
   using V = float_vec<T, vec_elems>;
   using V_ACC = float_vec<T_ACC, vec_elems>;
+  const int f = gridDim.y;
   const int n = (N * blockIdx.x) / gridDim.x;
-  const int c = threadIdx.x % (C / vec_elems);
+  const int c = (blockIdx.y * blockDim.x + threadIdx.x) % (C / vec_elems);
   const int g = (G * c) / (C / vec_elems);
   const int nc = n * (C / vec_elems) + c;
   const int ng = n * G + g;
   T_ACC coef2 = coef2_data[ng];
   T_ACC coef3 = coef3_data[ng];
-  const V *dy_vec = reinterpret_cast<const V*>(dy_data);
-  const V *X_vec = reinterpret_cast<const V*>(X_data);
-  V *dx_vec = reinterpret_cast<V*>(dx_data);
-  V_ACC *coef1_vec = reinterpret_cast<V_ACC*>(coef1_data);
-  V_ACC tmp_coef1 = coef1_vec[nc];
-#pragma unroll LOOP_I
-  for (int i  = 0; i < LOOP_I; ++i) {
+  const V *dy_vecs = reinterpret_cast<const V*>(dy_data);
+  const V *X_vecs = reinterpret_cast<const V*>(X_data);
+  V *dx_vecs = reinterpret_cast<V*>(dx_data);
+  V_ACC coef1_vec = reinterpret_cast<V_ACC*>(coef1_data)[nc];
+#pragma unroll
+  for (int i = 0; i < LOOP_I; ++i) {
     int idx = 0;
-    idx += blockIdx.x * LOOP_I * blockDim.x;
-    idx += i * blockDim.x;
+    idx += blockIdx.x * LOOP_I * f * blockDim.x;
+    idx += i * f * blockDim.x;
+    idx += blockIdx.y * blockDim.x;
     idx += threadIdx.x;
-    //dx_data[idx] = (coef1 * static_cast<T_ACC>(dy_data[idx])) + (coef2 * static_cast<T_ACC>(X_data[idx])) + coef3;
 
-    V tmp_dy = dy_vec[idx];
-    V tmp_X = X_vec[idx];
+    V dy_vec = dy_vecs[idx];
+    V X_vec = X_vecs[idx];
 
     if constexpr (vec_elems == 1)
-      dx_vec[idx] = {(tmp_coef1.x * tmp_dy.x) + ((coef2 * tmp_X.x) + coef3)};
+      dx_vecs[idx] = {(coef1_vec.x * dy_vec.x) + ((coef2 * X_vec.x) + coef3)};
     else if constexpr (vec_elems == 2) {
-      T dx_x, dx_y;
-      dx_x = (tmp_coef1.x * tmp_dy.x) + ((coef2 * tmp_X.x) + coef3);
-      dx_y = (tmp_coef1.y * tmp_dy.y) + ((coef2 * tmp_X.y) + coef3);
-      dx_vec[idx] = {dx_x, dx_y};
+      dx_vecs[idx] = {
+        (coef1_vec.x * dy_vec.x) + ((coef2 * X_vec.x) + coef3),
+        (coef1_vec.y * dy_vec.y) + ((coef2 * X_vec.y) + coef3),
+      };
     }
     else if constexpr (vec_elems == 4) {
-      T dx_x, dx_y, dx_z, dx_w;
-      dx_x = (tmp_coef1.x * tmp_dy.x) + ((coef2 * tmp_X.x) + coef3);
-      dx_y = (tmp_coef1.y * tmp_dy.y) + ((coef2 * tmp_X.y) + coef3);
-      dx_z = (tmp_coef1.z * tmp_dy.z) + ((coef2 * tmp_X.z) + coef3);
-      dx_w = (tmp_coef1.w * tmp_dy.w) + ((coef2 * tmp_X.w) + coef3);
-      dx_vec[idx] = {dx_x, dx_y, dx_z, dx_w};
-    }
-    else if constexpr (vec_elems == 8) {
-      T dx_x, dx_y, dx_z, dx_w, dx_a, dx_b, dx_c, dx_d;
-      dx_x = (tmp_coef1.x * tmp_dy.x) + ((coef2 * tmp_X.x) + coef3);
-      dx_y = (tmp_coef1.y * tmp_dy.y) + ((coef2 * tmp_X.y) + coef3);
-      dx_z = (tmp_coef1.z * tmp_dy.z) + ((coef2 * tmp_X.z) + coef3);
-      dx_w = (tmp_coef1.w * tmp_dy.w) + ((coef2 * tmp_X.w) + coef3);
-      dx_a = (tmp_coef1.a * tmp_dy.a) + ((coef2 * tmp_X.a) + coef3);
-      dx_b = (tmp_coef1.b * tmp_dy.b) + ((coef2 * tmp_X.b) + coef3);
-      dx_c = (tmp_coef1.c * tmp_dy.c) + ((coef2 * tmp_X.c) + coef3);
-      dx_d = (tmp_coef1.d * tmp_dy.d) + ((coef2 * tmp_X.d) + coef3);
-      dx_vec[idx] = {dx_x, dx_y, dx_z, dx_w, dx_a, dx_b, dx_c, dx_d};
+      dx_vecs[idx] = {
+        (coef1_vec.x * dy_vec.x) + ((coef2 * X_vec.x) + coef3),
+        (coef1_vec.y * dy_vec.y) + ((coef2 * X_vec.y) + coef3),
+        (coef1_vec.z * dy_vec.z) + ((coef2 * X_vec.z) + coef3),
+        (coef1_vec.w * dy_vec.w) + ((coef2 * X_vec.w) + coef3),
+      };
     }
   }
 }
+
+#define TENSORIT_DEBUG 0
 
 template <typename T>
 void run_gn_bwd_kernels(
@@ -329,11 +308,19 @@ void run_gn_bwd_kernels(
   T_ACC* xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
   T_ACC* dy_sum_data = xdy_sum_data + N * C * H;
 
-  int TPB = MIN(MAX_THREADS_PER_BLOCK, H * W * C);
-  const int blockDimX = MIN(TPB, C);
-  const int blockDimY = TPB / blockDimX;
-  const int f = MAX(C / TPB, 1); // note: impossible for f > 1 AND blockDimY > 1
-  spatial_loop<<<dim3(N, H, f), dim3(blockDimX, blockDimY), sizeof(T_ACC) * 2 * TPB>>>(
+  int TPB, d = 1, f = 1;
+  TPB = MIN(MAX_THREADS_PER_BLOCK, H * W * C);
+  if (C < TPB)
+    if (TPB / C / 4 != 0)
+      d = 4 * (TPB / C / 4); // prefer d being a multiple of 4 (e.g. for C=96, prefer TPB=384 and not 480) since it makes it more likely that TPB will be able to use the fast elementwise kernel
+    else
+      d = TPB / C;
+  else
+    while (C % f != 0 || C / f > MAX_THREADS_PER_BLOCK || G % f != 0)
+      ++f;
+  TPB = C * d / f;
+  //printf("starting bwd, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", N, H, W, C, G, C / G, TPB, d, f, G / f);
+  spatial_loop<<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB>>>(
       dy_data, X_data, 
       H, W, C,
       xdy_sum_data, dy_sum_data);
@@ -342,47 +329,65 @@ void run_gn_bwd_kernels(
   xdy_dy_sum = xdy_dy_sum.sum(3); // xdy_dy_sum shape now (2, N, C)
   xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
   dy_sum_data = xdy_sum_data + N * C;
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  //C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   T* dweight_data = dweight.mutable_data_ptr<T>();
   T* dbias_data = dbias.mutable_data_ptr<T>();
-  compute_dweight_dbias<<<1, C>>>(
+  compute_dweight_dbias<<<f, C / f>>>(
       mean_data, rstd_data,
       xdy_sum_data, dy_sum_data,
       N, C, G,
       dweight_data, dbias_data);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  //C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   at::Tensor coef1 = at::empty({N, C}, X_nhwc.options().dtype(kAccType));
   at::Tensor coef2 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
   at::Tensor coef3 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
-  T_ACC* coef1_data = coef1.mutable_data_ptr<T_ACC>();
-  T_ACC* coef2_data = coef2.mutable_data_ptr<T_ACC>();
-  T_ACC* coef3_data = coef3.mutable_data_ptr<T_ACC>();
-  compute_bwd_scale_biases<<<N, C, sizeof(T_ACC) * 2 * C>>>(
+  T_ACC *coef1_data = coef1.mutable_data_ptr<T_ACC>();
+  T_ACC *coef2_data = coef2.mutable_data_ptr<T_ACC>();
+  T_ACC *coef3_data = coef3.mutable_data_ptr<T_ACC>();
+  compute_bwd_scale_biases<<<dim3(N, f), C / f, sizeof(T_ACC) * 2 * C / f>>>(
       mean_data, rstd_data, weight_data,
       xdy_sum_data, dy_sum_data,
       H, W, C, G,
       coef1_data, coef2_data, coef3_data);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  //C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   T *dx_data = dX.mutable_data_ptr<T>();
-  const int ELEM_KERNEL_TPB = 512;
   const int LOOP_I = 4;
-
-  if (D % 8 == 0)
-    dx_elem_kernel<T, LOOP_I, 8><<<N * H * W * C / ELEM_KERNEL_TPB / LOOP_I / 8, ELEM_KERNEL_TPB>>>(
-        dy_data, X_data,
-        coef1_data, coef2_data, coef3_data,
-        N, C, G,
-        dx_data);
-  else if (D % 4 == 0) // arguments all in one line after this point because they're the same as the ones above
-    dx_elem_kernel<T, LOOP_I, 4><<<N * H * W * C / ELEM_KERNEL_TPB / LOOP_I / 4, ELEM_KERNEL_TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
-  else if (D % 2 == 0)
-    dx_elem_kernel<T, LOOP_I, 2><<<N * H * W * C / ELEM_KERNEL_TPB / LOOP_I / 2, ELEM_KERNEL_TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
-  else
-    dx_elem_kernel<T, LOOP_I, 1><<<N * H * W * C / ELEM_KERNEL_TPB / LOOP_I / 1, ELEM_KERNEL_TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  int vec_elems;
+  if (D % 4 == 0) vec_elems = 4;
+  else if (D % 2 == 0) vec_elems = 2;
+  else vec_elems = 1;
+  if (!TENSORIT_DEBUG && ((H * W * C) % (TPB * LOOP_I * f * vec_elems) == 0)) {
+    const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
+    //printf("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, num blocks (before vectors): %d\n", N, H, W, C, G, D, num_blocks);
+    if (D % 4 == 0)
+      dx_elem_kernel<T, LOOP_I, 4><<<dim3(num_blocks / 4, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+    else if (D % 2 == 0)
+      dx_elem_kernel<T, LOOP_I, 2><<<dim3(num_blocks / 2, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+    else
+      dx_elem_kernel<T, LOOP_I, 1><<<dim3(num_blocks / 1, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+  }
+  else {
+    //printf("TensorIterator starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d\n", N, H, W, C, G, D);
+    auto iter = at::TensorIteratorConfig()
+                    .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                    .resize_outputs(false)
+                    .add_owned_output(dX.view({N, H * W, G, D}))
+                    .add_owned_input(dy_nhwc.view({N, H * W, G, D}))
+                    .add_owned_input(X_nhwc.view({N, H * W, G, D}))
+                    .add_owned_input(coef1.view({N, 1, G, D}))
+                    .add_owned_input(coef2.view({N, 1, G, 1}))
+                    .add_owned_input(coef3.view({N, 1, G, 1}))
+                    .build();
+    at::native::gpu_kernel(
+        iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
+          return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
+              c3;
+        });
+  }
+  //C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 std::vector<at::Tensor> gn_nhwc_cuda_bwd(

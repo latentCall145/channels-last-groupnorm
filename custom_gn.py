@@ -9,12 +9,12 @@ gn_op = load(
         name="gn_op",
         sources=[
             os.path.join(module_dir, "custom_gn.cpp"),
-            #os.path.join(module_dir, "N_grid_gn_kernel.cu"),
+            os.path.join(module_dir, "N_grid_gn_kernel.cu"),
             os.path.join(module_dir, "NH_grid_gn_kernel.cu"),
             #os.path.join(module_dir, "NG_grid_gn_kernel.cu"),
             os.path.join(module_dir, "fully_fused_gn_kernel.cu"),
             os.path.join(module_dir, "bwd_gn_kernel.cu"),
-            #os.path.join(module_dir, "nchw_kernel.cu")
+            os.path.join(module_dir, "nchw_kernel.cu")
             ],
         extra_cuda_cflags=[
             '-use_fast_math',
@@ -66,11 +66,8 @@ class GN_NHWC(nn.GroupNorm):
         if C // G > 512:
             raise ValueError(f'Error in fwd for X.shape={x.shape}, G={G}: C // G = {C // G} which is greater than 512. This input is not supported.')
 
-        #f = max(1, C // 512)
-        #bdx = min(G // f, 512)
-        #d = min(H * G // f, 512) // bdx
-        #if W % d != 0:
-        #    raise ValueError(f'Error in fwd for X.shape={x.shape}, G={G}: X has width {W} which is not a multiple of {d}. This input is not supported.')
+        #if H * W % 8 != 0:
+        #    raise ValueError(f'Error in fwd for X.shape={x.shape}, G={G}: H * W is not a multiple of 8. This input is not supported.')
 
         if self.affine:
             return GN_NHWC_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
@@ -106,11 +103,11 @@ class GN_NCHW(nn.GroupNorm):
             return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
 
 if __name__ == '__main__':
-    DTYPE = torch.double
     DTYPE = torch.float
+    DTYPE = torch.double
     DTYPE = torch.bfloat16
     print('DTYPE:', DTYPE)
-    MODE = 'check' # can be 'check', 'bench', other modes do both
+    MODE = 'bench' # can be 'check', 'bench', other modes do both
     CHECK_PROF = True
 
     if MODE != 'bench':
@@ -121,6 +118,10 @@ if __name__ == '__main__':
         #itertools.product(DTYPEs, Bs, Rs, Cs)
 
         for B, R, C, G in (
+            (1, 512, 96, 32),
+            #(1, 256, 256, 32),
+            #(1, 64, 64, 32),
+            #(1, 64, 96, 32),
             #(1, 64, 960, 32),
             #(1, 64, 640, 32),
             #(1, 64, 256, 32),
@@ -137,19 +138,25 @@ if __name__ == '__main__':
             #(1, 16, 640, 32),
             #(1, 8, 1280, 32),
 
-            (1, 512, 64, 32),
+            #(1, 512, 64, 32),
+            #(16, 512, 128, 32),
             #(1, 64, 512, 32),
             #(1, 64, 256, 32),
             #(2, 64, 128, 32),
+            #(2, 32, 128, 32),
+            #(2, 8, 512, 32),
+            #(2, 4, 512, 32),
+            #(1, 4, 512, 32),
+            #(2, 4, 256, 32),
+            #(1, 4, 256, 32),
             #(13, 65, 961, 31),
             #(2, 65, 128, 32),
-            #(13, 67, 961, 31),
             #(1, 3, 6, 2),
         ):
             dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
-            estimated_mem_usage_gib = 2 * (4.5 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
-            if estimated_mem_usage_gib > 4: # vram filter
-                continue
+            #estimated_mem_usage_gib = 2 * (4.5 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
+            #if estimated_mem_usage_gib > 4: # vram filter
+            #    continue
             torch.cuda.empty_cache()
             print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
             #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
@@ -158,14 +165,15 @@ if __name__ == '__main__':
             torch.random.manual_seed(0)
 
             gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
+            #gn2 = nn.GroupNorm(G, C).cuda().to(DTYPE)
 
             if CHECK_PROF:
                 #g1 = gn1(x.contiguous())
-                g2 = gn2(x)
                 #g1sum = g1.sum()
-                #g2sum = g2.sum()
                 #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
-                #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
+                g2 = gn2(x)
+                g2sum = g2.sum()
+                g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
             else:
                 gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
                 with torch.no_grad():
@@ -181,50 +189,51 @@ if __name__ == '__main__':
                 g1sum = (g1 * rand_dy).sum()
                 g2sum = (g2 * rand_dy).sum()
 
-                #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
-                #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
-                #g1_grad_wrt_w = g1_grad_wrt_w.reshape((gn1.weight.numel(),))
-                #g2_grad_wrt_w = g2_grad_wrt_w.reshape((gn2.weight.numel(),))
-
-                #g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
-                #g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
-
-                #g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-                #g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+                def print_err(act1, act2, left_pad=0):
+                    lpad = ' ' * left_pad
+                    if (act1 - act2).abs().mean() > 1e-5:
+                        print(f'{lpad}{act1 - act2}')
+                        print(f'{lpad}{(act1 - act2).abs().mean()}')
+                    else:
+                        print(f'{lpad}No difference found')
 
                 print('  FORWARD')
-                if (g1 - g2).pow(2).mean() > 1e-5:
-                    print('   ', g1 - g2)
-                    print('   ', (g1 - g2).pow(2).mean())
-                    #print('   ', (g1 - g2)[:, :8].pow(2).mean())
-                    #for c in range(C):
-                    #    if (g1 - g2)[:, c].pow(2).mean() < 1e-5:
-                    #        print('   ', c)
-                    #print('  BACKWARD')
-                    #print('    g1 sum wrt w')
-                    #print('     ', g1_grad_wrt_w - g2_grad_wrt_w)
-                    #print('    g1 sum wrt b')
-                    #print('     ', g1_grad_wrt_b - g2_grad_wrt_b)
-                    #print('    g1 sum wrt x')
-                    #print('     ', g1_grad_wrt_x-g2_grad_wrt_x)
-                else:
-                    print('    No difference found')
+                print_err(g1, g2, 4)
+
+                print('  BACKWARD')
+                print('    wrt weight')
+                g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
+                g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
+                print_err(g1_grad_wrt_w, g2_grad_wrt_w, 6)
+
+                print('    wrt bias')
+                g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
+                g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
+                print_err(g1_grad_wrt_b, g2_grad_wrt_b, 6)
+
+                print('    wrt X')
+                g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+                g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+                print_err(g1_grad_wrt_x, g2_grad_wrt_x, 6)
 
     if MODE != 'check':
         NSEC = 1 # number of seconds that each kernel runs for on a certain input
         BATCHES = [1, 2, 4, 8, 16, 32]
-        CHANNELS = [32, 64, 128, 256, 512]
+        #CHANNELS = [32, 64, 128, 256, 512]
+        CHANNELS = [320, 640, 960, 1920, 2560]
         RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
-        NUM_GROUPS = [4, 8, 16, 32, 64, 128]
+        #NUM_GROUPS = [4, 8, 16, 32, 64, 128]
+        NUM_GROUPS = [32]
         BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
         GN_KERNELS = [
-                (GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
-                (GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
+                #(GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
+                #(GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
                 #(GN_NHWC, 'GN NHWC N grid (custom op)', gn_op.fwd_N_grid),
                 #(GN_NHWC, 'GN NHWC NG grid NG grid (custom op)', gn_op.fwd_NG_grid),
                 #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', gn_op.nchwforward),
-                (nn.GroupNorm, 'torch.nn GN NCHW', None),
-                #(GN_NHWC, 'GN NHWC', None),
+                #(nn.GroupNorm, 'torch.nn GN NCHW', None),
+                (GN_NCHW, 'torch.nn GN NCHW (compiled from src)', None),
+                (GN_NHWC, 'GN NHWC', None),
         ]
 
         os.makedirs('csvs', exist_ok=True)
@@ -238,6 +247,7 @@ if __name__ == '__main__':
             if G > C:
                 return False
 
+            '''
             return (B, C, R, G) in {
                     (1,  512, 8, 32),
                     #(2,  512, 8, 32),
@@ -274,6 +284,7 @@ if __name__ == '__main__':
                     #(16, 128, 32, 16),
                     #(32, 128, 32, 16),
                     }
+            '''
 
             dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
             estimated_mem_usage_gib = (3 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)

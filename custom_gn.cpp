@@ -37,7 +37,6 @@ std::vector<at::Tensor> gn_nhwc_cuda_fwd_NH_grid(
     const int G,
     float eps);
 
-/*
 std::vector<at::Tensor> gn_nhwc_cuda_fwd_N_grid(
     const at::Tensor& X,
     const at::Tensor& weight,
@@ -45,6 +44,7 @@ std::vector<at::Tensor> gn_nhwc_cuda_fwd_N_grid(
     const int G,
     float eps);
 
+/*
 std::vector<at::Tensor> gn_nhwc_cuda_fwd_NG_grid(
     const at::Tensor& X,
     const at::Tensor& weight,
@@ -82,7 +82,6 @@ std::vector<at::Tensor> gn_nhwc_fwd_NH_grid(
   return gn_nhwc_cuda_fwd_NH_grid(X, weight, bias, G, eps);
 }
 
-/*
 std::vector<at::Tensor> gn_nhwc_fwd_N_grid(
     const at::Tensor X,
     const at::Tensor weight,
@@ -95,6 +94,7 @@ std::vector<at::Tensor> gn_nhwc_fwd_N_grid(
   return gn_nhwc_cuda_fwd_N_grid(X, weight, bias, G, eps);
 }
 
+/*
 std::vector<at::Tensor> gn_nhwc_fwd_NG_grid(
     const at::Tensor X,
     const at::Tensor weight,
@@ -138,7 +138,6 @@ std::vector<at::Tensor> gn_nhwc_bwd(
   return gn_nhwc_cuda_bwd(dy, X, means, rstds, weight, G);
 }
 
-/*
 std::vector<at::Tensor> gn_nchw_forward(
     const at::Tensor X,
     const at::Tensor weight,
@@ -193,14 +192,13 @@ std::vector<at::Tensor> gn_nchw_backward(
 
   return {dX, dgamma, dbeta};
 }
-*/
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  //m.def("fwd_N_grid", &gn_nhwc_fwd_N_grid, "GN NHWC forward (N grid)");
+  m.def("fwd_N_grid", &gn_nhwc_fwd_N_grid, "GN NHWC forward (N grid)");
   m.def("fwd_NH_grid", &gn_nhwc_fwd_NH_grid, "GN NHWC forward (NH grid)");
   //m.def("fwd_NG_grid", &gn_nhwc_fwd_NG_grid, "GN NHWC forward (NG grid)");
   m.def("fwd_fused", &gn_nhwc_fwd_fused, "GN NHWC forward_fused");
   m.def("bwd", &gn_nhwc_bwd, "GN NHWC backward");
-  //m.def("nchwforward", &gn_nchw_forward, "GN NCHW forward");
-  //m.def("nchwbackward", &gn_nchw_backward, "GN NCHW backward");
+  m.def("nchwforward", &gn_nchw_forward, "GN NCHW forward");
+  m.def("nchwbackward", &gn_nchw_backward, "GN NCHW backward");
 }
