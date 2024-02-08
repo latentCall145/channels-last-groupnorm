@@ -89,13 +89,15 @@ spatial_loop(
     reduce_idx += blockIdx.z * TPB; // dim 4, TPB stride (in kernel 1, threadIdx.z is always 0 so this statement does nothing)
     reduce_idx += threadIdx.x; // dim 5, 1 stride
     T_ACC dy_elem = static_cast<T_ACC>(dy_data[reduce_idx]);
-    xdy_sum += dy_elem * X_data[reduce_idx];
+    T_ACC X_elem = static_cast<T_ACC>(X_data[reduce_idx]);
+    xdy_sum += dy_elem * X_elem;
     dy_sum += dy_elem;
   }
   if ((int)(i * d + threadIdx.y) < W) { // last iteration to deal with inputs with weird width sizes
     int reduce_idx = blockIdx.x * H * W * C + blockIdx.y * W * C + i * d * C + threadIdx.y * C + blockIdx.z * TPB + threadIdx.x;
     T_ACC dy_elem = static_cast<T_ACC>(dy_data[reduce_idx]);
-    xdy_sum += dy_elem * X_data[reduce_idx];
+    T_ACC X_elem = static_cast<T_ACC>(X_data[reduce_idx]);
+    xdy_sum += dy_elem * X_elem;
     dy_sum += dy_elem;
   }
 

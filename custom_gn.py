@@ -9,10 +9,7 @@ gn_op = load(
         name="gn_op",
         sources=[
             os.path.join(module_dir, "custom_gn.cpp"),
-            os.path.join(module_dir, "N_grid_gn_kernel.cu"),
             os.path.join(module_dir, "NH_grid_gn_kernel.cu"),
-            #os.path.join(module_dir, "NG_grid_gn_kernel.cu"),
-            os.path.join(module_dir, "fully_fused_gn_kernel.cu"),
             os.path.join(module_dir, "bwd_gn_kernel.cu"),
             os.path.join(module_dir, "nchw_kernel.cu")
             ],
@@ -103,12 +100,12 @@ class GN_NCHW(nn.GroupNorm):
             return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
 
 if __name__ == '__main__':
+    DTYPE = torch.bfloat16
     DTYPE = torch.float
     DTYPE = torch.double
-    DTYPE = torch.bfloat16
     print('DTYPE:', DTYPE)
-    MODE = 'bench' # can be 'check', 'bench', other modes do both
-    CHECK_PROF = True
+    MODE = 'check' # can be 'check', 'bench', other modes do both
+    CHECK_PROF = False
 
     if MODE != 'bench':
         #DTYPEs = (torch.bfloat16, torch.float, torch.double)
@@ -119,53 +116,49 @@ if __name__ == '__main__':
 
         for B, R, C, G in (
             (1, 512, 96, 32),
-            #(1, 256, 256, 32),
-            #(1, 64, 64, 32),
-            #(1, 64, 96, 32),
-            #(1, 64, 960, 32),
-            #(1, 64, 640, 32),
-            #(1, 64, 256, 32),
-            #(1, 32, 1920, 32),
-            #(2, 32, 1280, 32),
-            #(1, 64, 320, 32),
-            #(1, 32, 960, 32),
-            #(1, 16, 2560, 32),
-            #(1, 32, 640, 32),
-            #(1, 16, 1920, 32),
-            #(1, 16, 1280, 32),
-            #(1, 32, 320, 32),
-            #(1, 8, 2560, 32),
-            #(1, 16, 640, 32),
-            #(1, 8, 1280, 32),
+            (1, 256, 256, 32),
+            (1, 64, 64, 32),
+            (1, 64, 96, 32),
+            (1, 64, 960, 32),
+            (1, 64, 640, 32),
+            (1, 64, 256, 32),
+            (1, 32, 1920, 32),
+            (2, 32, 1280, 32),
+            (1, 64, 320, 32),
+            (1, 32, 960, 32),
+            (1, 16, 2560, 32),
+            (1, 32, 640, 32),
+            (1, 16, 1920, 32),
+            (1, 16, 1280, 32),
+            (1, 32, 320, 32),
+            (1, 8, 2560, 32),
+            (1, 16, 640, 32),
+            (1, 8, 1280, 32),
 
-            #(1, 512, 64, 32),
-            #(16, 512, 128, 32),
-            #(1, 64, 512, 32),
-            #(1, 64, 256, 32),
-            #(2, 64, 128, 32),
-            #(2, 32, 128, 32),
-            #(2, 8, 512, 32),
-            #(2, 4, 512, 32),
-            #(1, 4, 512, 32),
-            #(2, 4, 256, 32),
-            #(1, 4, 256, 32),
-            #(13, 65, 961, 31),
-            #(2, 65, 128, 32),
-            #(1, 3, 6, 2),
+            (1, 512, 64, 32),
+            (1, 64, 512, 32),
+            (1, 64, 256, 32),
+            (2, 64, 128, 32),
+            (2, 32, 128, 32),
+            (2, 8, 512, 32),
+            (2, 4, 512, 32),
+            (1, 4, 512, 32),
+            (2, 4, 256, 32),
+            (1, 4, 256, 32),
+            (13, 65, 961, 31),
+            (2, 65, 128, 32),
+            (1, 3, 6, 2),
         ):
             dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
-            #estimated_mem_usage_gib = 2 * (4.5 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
-            #if estimated_mem_usage_gib > 4: # vram filter
-            #    continue
+            estimated_mem_usage_gib = 2 * (4.5 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
+            if estimated_mem_usage_gib > 4: # vram filter
+                continue
             torch.cuda.empty_cache()
             print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
-            #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
             x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 1000
-            #x = torch.zeros((B, R, R, C), dtype=DTYPE, device='cuda').permute(0, 3, 1, 2)
             torch.random.manual_seed(0)
 
             gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
-            #gn2 = nn.GroupNorm(G, C).cuda().to(DTYPE)
 
             if CHECK_PROF:
                 #g1 = gn1(x.contiguous())
