@@ -1,34 +1,35 @@
-#include <ATen/AccumulateType.h> // acc_type
-#include <ATen/native/cuda/Loops.cuh>
-#include <ATen/Tensor.h> // at::tensor
-#include <ATen/ops/empty.h>
-#include <ATen/ops/empty_like.h>
-#include <ATen/Dispatch.h> // at_dispatch macro
-//#include <ATen/cuda/Exceptions.h> // C10_CUDA_KERNEL_LAUNCH_CHECK
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/core/ScalarType.h>
-#include <vector> // std::vector
+#include "gn_kernel.h"
 #include "vecs.h"
 #define MAX_THREADS_PER_BLOCK 512
 #define MAX(a, b) (a > b) ? a : b
 #define MIN(a, b) (a < b) ? a : b
+#define DEBUG(format, args...) if (0) fprintf(stderr, format, args)
+
+template <typename T>
+struct acc_type { using type = float; };
+template <>
+struct acc_type<double> { using type = double; };
+
+typedef struct block_params {
+  int t; // threads per block
+  int d; // dimensionality (number of data rows per threadblock)
+  int f; // factor (number of different threadblocks needed to represent one row of data) 
+} block_params_t;
 
 template <typename T>
 __device__ void
 sum_reduce(
     T vals_reduced,
     const int start_stride,
-    //const int size,
     const int end_stride
   ) {
-  //const int TPB = blockDim.y * blockDim.x;
   const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  //int reduce_n = TPB / end_stride;
-  //int reduce_n = size / end_stride;
   int reduce_n = 2 * start_stride / end_stride;
 
 #pragma unroll
   for (int stride = start_stride; stride >= end_stride && reduce_n % 2 == 0 && stride % end_stride == 0; stride >>= 1, reduce_n >>= 1) {
-  //for (int stride = start_stride; stride >= end_stride && reduce_n % 2 == 0 && stride % end_stride == 0; stride >>= 1, reduce_n >>= 1) {
     if (tid < stride)
       vals_reduced[tid] += vals_reduced[tid + stride];
     __syncthreads();
@@ -43,14 +44,13 @@ sum_reduce(
 
 template <typename T>
 __global__ void
-spatial_loop(
+width_reduce(
       const T* dy_data,
       const T* X_data,
       const int H,
       const int W,
       const int C,
-      at::acc_type<T, true>* xdy_sum_data,
-      at::acc_type<T, true>* dy_sum_data) {
+      typename acc_type<T>::type *xdy_dy_sum_data) {
   /*
      Performs a loop over the spatial dimension W, loading and summing dy and X. Spatial dimension H is processed in a separate kernel.
      C <= MAX_THREADS_PER_BLOCK (Kernel 1):
@@ -60,7 +60,7 @@ spatial_loop(
         Cd = TPB (threads per block)
        X shape: (N, H, W, C) -view-> (N, H, W/d, d, 1, C); X stride: (HWC, WC, dC, C, C, 1)
        shmem reduction: (d, C) -reduce-> C
-       output buffer: (N, C, H)
+       output buffer: (N, C, H, 2)
      C > MAX_THREADS_PER_BLOCK (Kernel 2):
        griddim: (x=N, y=H, z=f); blockdim: (x=TPB, y=d=1)
         f = factor of channels that each thread have to process separately
@@ -68,10 +68,10 @@ spatial_loop(
         f * TPB = C
        X shape: (N, H, W, C) -view-> (N, H, W/d, d, f, TPB); X stride: (HWC, WC, dC, C, TPB, 1)
        shmem reduction: (d, TPB) -reduce-> TPB
-       output buffer: (N, f, TPB, H) -view-> (N, C, H)
+       output buffer: (N, f, TPB, H, 2) -view-> (N, C, H, 2)
    */
+  using T_ACC = typename acc_type<T>::type;
 
-  using T_ACC = at::acc_type<T, true>;
   const int TPB = blockDim.y * blockDim.x;
   const int d = blockDim.y;
   T_ACC xdy_sum = 0;
@@ -109,19 +109,60 @@ spatial_loop(
   vals_reduced[2 * tid] = xdy_sum;
   vals_reduced[2 * tid + 1] = dy_sum;
   __syncthreads();
-  //sum_reduce(vals_reduced, 2 * TPB, 2 * C);
   sum_reduce(vals_reduced, TPB, 2 * C);
 
   // put reduced outputs into return buffers
   if (tid < C) {
     int out_idx = 0;
     out_idx += blockIdx.x * C * H; // dim 0, CH stride
-    out_idx += blockIdx.z * TPB * H; // dim 1, TPB*H stride (if f=1, this line is a no-op)
-    out_idx += threadIdx.x * H; // dim 2, H stride
+    out_idx += (blockIdx.z * TPB + tid) * H; // dim 1, TPB*H stride (if f=1, this line is a no-op)
     out_idx += blockIdx.y; // dim 3, 1 stride
 
-    xdy_sum_data[out_idx] = vals_reduced[2 * tid];
-    dy_sum_data[out_idx] = vals_reduced[2 * tid + 1];
+    xdy_dy_sum_data[2 * out_idx] = vals_reduced[2 * tid];
+    xdy_dy_sum_data[2 * out_idx + 1] = vals_reduced[2 * tid + 1];
+  }
+}
+
+template <typename T>
+__global__ void
+height_reduce(
+    T *xdy_dy_sum_data, // no need to specify T_ACC as T is already an accumulation type
+    const int H,
+    const int C,
+    T *xdy_sum_data,
+    T *dy_sum_data
+  ) {
+  const int TPB = blockDim.x;
+  const int tid = threadIdx.x;
+
+  // shmem reduction
+  extern __shared__ char vals_reduced_uncasted[];
+  T *vals_reduced = reinterpret_cast<T*>(vals_reduced_uncasted);
+  T sum = 0;
+  int i;
+#pragma unroll
+  for (i = 0; i < ceil((float)2 * H / TPB) - 1; ++i) {
+    int idx = 0;
+    idx += blockIdx.x * C * H * 2;
+    idx += blockIdx.y * H * 2;
+    idx += i * TPB;
+    idx += tid;
+    sum += xdy_dy_sum_data[idx];
+  }
+  if (i * TPB + tid < 2 * H)
+    sum += xdy_dy_sum_data[blockIdx.x * C * H * 2 + blockIdx.y * H * 2 + i * TPB + tid];
+
+  vals_reduced[tid] = sum;
+  __syncthreads();
+  sum_reduce(vals_reduced, TPB / 2, 2);
+
+  // put reduced outputs into return buffers
+  if (tid == 0) {
+    int out_idx = blockIdx.x * C + blockIdx.y;
+    xdy_sum_data[out_idx] = vals_reduced[0];
+    dy_sum_data[out_idx] = vals_reduced[1];
+    //if (blockIdx.x < 2 && blockIdx.y < 2 && blockIdx.z == 0)
+    //  printf("N: %d, C: %d, xdy sum: %f, dy sum: %f, vals_reduced_size: %d, TPB: %d\n", blockIdx.x, blockIdx.y, vals_reduced[0], vals_reduced[1], vals_reduced_size, TPB);
   }
 }
 
@@ -131,15 +172,15 @@ compute_bwd_scale_biases(
     const T* mean_data,
     const T* rstd_data,
     const T* weight_data,
-    at::acc_type<T, true>* xdy_sum_data,
-    at::acc_type<T, true>* dy_sum_data,
+    typename acc_type<T>::type* xdy_sum_data,
+    typename acc_type<T>::type* dy_sum_data,
     const int H,
     const int W,
     const int C,
     const int G,
-    at::acc_type<T, true>* coef1_data,
-    at::acc_type<T, true>* coef2_data,
-    at::acc_type<T, true>* coef3_data) {
+    typename acc_type<T>::type* coef1_data,
+    typename acc_type<T>::type* coef2_data,
+    typename acc_type<T>::type* coef3_data) {
   /*
      griddim: (x=N, y=f); blockdim: (x=C/f)
       d = num. spatial elements (from HW dimension) each thread-block processes in parallel
@@ -148,7 +189,7 @@ compute_bwd_scale_biases(
      shmem reduction: (D, G) -reduce-> G
      output buffer: (N, G)
    */
-  using T_ACC = at::acc_type<T, true>;
+  using T_ACC = typename acc_type<T>::type;
   const int D = C / G;
   const int f = gridDim.y;
   const int Gf = G / f;
@@ -179,9 +220,9 @@ compute_bwd_scale_biases(
     const T_ACC sum1 = vals_reduced[2 * (g % Gf)];
     const T_ACC sum2 = vals_reduced[2 * (g % Gf) + 1];
     const T_ACC s = T_ACC(1) / static_cast<T_ACC>(D * H * W);
-    const T_ACC x = (sum2 * mean_elem - sum1) * (rstd_elem * rstd_elem * rstd_elem * s);
+    const T_ACC x = (sum2 * mean_elem - sum1) * rstd_elem * rstd_elem * rstd_elem * s;
     coef2_data[ng] = x;
-    coef3_data[ng] = (-x * mean_elem) - (sum2 * rstd_elem * s);
+    coef3_data[ng] = (-x * mean_elem) - (sum2 * s * rstd_elem);
   }
 }
 
@@ -190,15 +231,15 @@ __global__ void
 compute_dweight_dbias(
     const T* mean_data,
     const T* rstd_data,
-    at::acc_type<T, true>* xdy_sum_data,
-    at::acc_type<T, true>* dy_sum_data,
+    typename acc_type<T>::type *xdy_sum_data,
+    typename acc_type<T>::type *dy_sum_data,
     const int N,
     const int C,
     const int G,
     T* dweight_data,
     T* dbias_data) {
   // gridDim: (x=f), blockDim: (x=C / f)
-  using T_ACC = at::acc_type<T, true>;
+  using T_ACC = typename acc_type<T>::type;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int D = C / G;
   const int g = c / D;
@@ -209,8 +250,8 @@ compute_dweight_dbias(
   for (int n = 0; n < N; ++n) {
     const int nc = n * C + c;
     const int ng = n * G + g;
-    sum1 += ((xdy_sum_data[nc] - dy_sum_data[nc] * static_cast<T_ACC>(mean_data[ng])) * static_cast<T_ACC>(rstd_data[ng]));
-    sum2 += dy_sum_data[nc];
+    sum1 += (xdy_sum_data[nc] - dy_sum_data[nc] * static_cast<T_ACC>(mean_data[ng])) * static_cast<T_ACC>(rstd_data[ng]);
+    sum2 += static_cast<T_ACC>(dy_sum_data[nc]);
   }
   dweight_data[c] = sum1;
   dbias_data[c] = sum2;
@@ -221,15 +262,15 @@ __global__ void
 dx_elem_kernel(
     const T* dy_data,
     const T* X_data,
-    at::acc_type<T, true>* coef1_data,
-    at::acc_type<T, true>* coef2_data,
-    at::acc_type<T, true>* coef3_data,
+    typename acc_type<T>::type* coef1_data,
+    typename acc_type<T>::type* coef2_data,
+    typename acc_type<T>::type* coef3_data,
     const int N,
     const int C,
     const int G,
     T* dx_data
     ) {
-  using T_ACC = at::acc_type<T, true>;
+  using T_ACC = typename acc_type<T>::type;
   using V = float_vec<T, vec_elems>;
   using V_ACC = float_vec<T_ACC, vec_elems>;
   const int f = gridDim.y;
@@ -274,150 +315,129 @@ dx_elem_kernel(
   }
 }
 
-#define TENSORIT_DEBUG 0
+inline block_params_t simple_calc_block_params(int ideal_num_threads, int threads_per_row, int d_preferred_divisibility = 1, int f_divides = -1) {
+  /*
+  d_preferred_divisibility: if possible, make d a multiple of d_preferred divisibilty (useful for kernels which require inputs to be divisible by the number of threads per block e.g. elementwise kernel)
+  f_divides: parameter if user needs to explicitly specify a stricter requirement on the divisibility of the number of threads per block
+    - e.g. fwd with C = 2560, G = 32, TPB = 480 wouldn't work since that means 32 groups are split over f=5 blocks (5.333 groups per block)
+    - e.g. fwd with C = 2560, G = 32, TPB = 320 would work since that means 32 groups are split over f=8 blocks (4 groups per block), you could say that f divides 32 (f_divides=32)
+  */
+  int TPB, d = 1, f = 1;
+  f_divides = f_divides == -1 ? threads_per_row : f_divides;
+  TPB = MIN(MAX_THREADS_PER_BLOCK, ideal_num_threads);
+  if (threads_per_row < TPB)
+    if (TPB / threads_per_row / d_preferred_divisibility != 0)
+      d = d_preferred_divisibility * (TPB / threads_per_row / d_preferred_divisibility); // prefer d being a multiple of d_preferred_divisibility (e.g. for C=96, prefer TPB=38d_preferred_divisibility and not d_preferred_divisibility80) since it makes it more likely that TPB will be able to use the fast elementwise kernel
+    else
+      d = TPB / threads_per_row;
+  else
+    while (f_divides % f != 0 || threads_per_row / f > MAX_THREADS_PER_BLOCK)
+      ++f;
+  TPB = threads_per_row * d / f;
+  return {TPB, d, f};
+}
+
+#define ELEM_DEBUG 0
 
 template <typename T>
 void run_gn_bwd_kernels(
-      const at::Tensor& dy_nhwc,
-      const at::Tensor& X_nhwc,
-      const at::Tensor& weight,
-      const at::Tensor& mean,
-      const at::Tensor& rstd,
+      const T *dy_data,
+      const T *X_data,
+      const T *weight_data,
+      const T *mean_data,
+      const T *rstd_data,
+      const int N,
+      const int H,
+      const int W,
+      const int C,
       const int G,
-      at::Tensor& dX,
-      at::Tensor& dweight,
-      at::Tensor& dbias
+      T *dx_data,
+      T *dweight_data,
+      T *dbias_data
   ) {
-  using T_ACC = at::acc_type<T, true>;
-  const int N = X_nhwc.size(0);
-  const int H = X_nhwc.size(1);
-  const int W = X_nhwc.size(2);
-  const int C = X_nhwc.size(3);
+  using T_ACC = typename acc_type<T>::type;
   const int D = C / G;
 
-  const T* dy_data = dy_nhwc.const_data_ptr<T>();
-  const T* X_data = X_nhwc.const_data_ptr<T>();
-  const T* mean_data = mean.const_data_ptr<T>();
-  const T* rstd_data = rstd.const_data_ptr<T>();
-  const T* weight_data = weight.const_data_ptr<T>();
+  T_ACC* xdy_dy_sum_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C * H * 2);
 
-  const c10::ScalarType kAccType =
-      (X_nhwc.scalar_type() == c10::ScalarType::Half || X_nhwc.scalar_type() == c10::ScalarType::BFloat16)
-      ? at::kFloat
-      : X_nhwc.scalar_type();
-
-  at::Tensor xdy_dy_sum = at::empty({2, N, C, H}, X_nhwc.options().dtype(kAccType));
-  T_ACC* xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
-  T_ACC* dy_sum_data = xdy_sum_data + N * C * H;
-
-  int TPB, d = 1, f = 1;
-  TPB = MIN(MAX_THREADS_PER_BLOCK, H * W * C);
-  if (C < TPB)
-    if (TPB / C / 4 != 0)
-      d = 4 * (TPB / C / 4); // prefer d being a multiple of 4 (e.g. for C=96, prefer TPB=384 and not 480) since it makes it more likely that TPB will be able to use the fast elementwise kernel
-    else
-      d = TPB / C;
-  else
-    while (C % f != 0 || C / f > MAX_THREADS_PER_BLOCK || G % f != 0)
-      ++f;
-  TPB = C * d / f;
-  //printf("starting bwd, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", N, H, W, C, G, C / G, TPB, d, f, G / f);
-  spatial_loop<<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB>>>(
-      dy_data, X_data, 
-      H, W, C,
-      xdy_sum_data, dy_sum_data);
-
-  // sum over H dimension
-  xdy_dy_sum = xdy_dy_sum.sum(3); // xdy_dy_sum shape now (2, N, C)
-  xdy_sum_data = xdy_dy_sum.mutable_data_ptr<T_ACC>();
-  dy_sum_data = xdy_sum_data + N * C;
-  //C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  T* dweight_data = dweight.mutable_data_ptr<T>();
-  T* dbias_data = dbias.mutable_data_ptr<T>();
-  compute_dweight_dbias<<<f, C / f>>>(
-      mean_data, rstd_data,
-      xdy_sum_data, dy_sum_data,
-      N, C, G,
-      dweight_data, dbias_data);
-  //C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  at::Tensor coef1 = at::empty({N, C}, X_nhwc.options().dtype(kAccType));
-  at::Tensor coef2 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
-  at::Tensor coef3 = at::empty({N, G}, X_nhwc.options().dtype(kAccType));
-  T_ACC *coef1_data = coef1.mutable_data_ptr<T_ACC>();
-  T_ACC *coef2_data = coef2.mutable_data_ptr<T_ACC>();
-  T_ACC *coef3_data = coef3.mutable_data_ptr<T_ACC>();
-  compute_bwd_scale_biases<<<dim3(N, f), C / f, sizeof(T_ACC) * 2 * C / f>>>(
-      mean_data, rstd_data, weight_data,
-      xdy_sum_data, dy_sum_data,
-      H, W, C, G,
-      coef1_data, coef2_data, coef3_data);
-  //C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  T *dx_data = dX.mutable_data_ptr<T>();
-  const int LOOP_I = 4;
-  int vec_elems;
-  if (D % 4 == 0) vec_elems = 4;
-  else if (D % 2 == 0) vec_elems = 2;
-  else vec_elems = 1;
-  if (!TENSORIT_DEBUG && ((H * W * C) % (TPB * LOOP_I * f * vec_elems) == 0)) {
-    const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
-    //printf("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, num blocks (before vectors): %d\n", N, H, W, C, G, D, num_blocks);
-    if (D % 4 == 0)
-      dx_elem_kernel<T, LOOP_I, 4><<<dim3(num_blocks / 4, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
-    else if (D % 2 == 0)
-      dx_elem_kernel<T, LOOP_I, 2><<<dim3(num_blocks / 2, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
-    else
-      dx_elem_kernel<T, LOOP_I, 1><<<dim3(num_blocks / 1, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+  // sum over W dim
+  {
+    auto [TPB, d, f] = simple_calc_block_params(W * C, C, 4, G);
+    DEBUG("starting width reduce, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
+    width_reduce<<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB>>>(
+        dy_data, X_data, 
+        H, W, C,
+        xdy_dy_sum_data);
   }
-  else {
-    //printf("TensorIterator starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d\n", N, H, W, C, G, D);
-    auto iter = at::TensorIteratorConfig()
-                    .check_all_same_dtype(std::is_same<T, T_ACC>::value)
-                    .resize_outputs(false)
-                    .add_owned_output(dX.view({N, H * W, G, D}))
-                    .add_owned_input(dy_nhwc.view({N, H * W, G, D}))
-                    .add_owned_input(X_nhwc.view({N, H * W, G, D}))
-                    .add_owned_input(coef1.view({N, 1, G, D}))
-                    .add_owned_input(coef2.view({N, 1, G, 1}))
-                    .add_owned_input(coef3.view({N, 1, G, 1}))
-                    .build();
-    at::native::gpu_kernel(
-        iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
-          return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
-              c3;
-        });
+
+  T_ACC* xdy_sum_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C);
+  T_ACC* dy_sum_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C);
+  // sum over H dim
+  {
+    auto [TPB, d, f] = simple_calc_block_params(2 * H, 2);
+    DEBUG("starting height reduce, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
+    //height_reduce<<<dim3(N, C), TPB, sizeof(T_ACC) * host_next_power_of_2(TPB)>>>(
+    height_reduce<<<dim3(N, C), TPB, sizeof(T_ACC) * TPB>>>(
+        xdy_dy_sum_data,
+        H, C,
+        xdy_sum_data, dy_sum_data);
   }
-  //C10_CUDA_KERNEL_LAUNCH_CHECK();
+  c10::cuda::CUDACachingAllocator::raw_delete(xdy_dy_sum_data);
+
+  // compute weight/bias grads
+  {
+    auto [TPB, d, f] = simple_calc_block_params(C, C, 1, G);
+    DEBUG("starting compute dweight dbias, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
+    compute_dweight_dbias<<<f, C / f>>>(
+        mean_data, rstd_data,
+        xdy_sum_data, dy_sum_data,
+        N, C, G,
+        dweight_data, dbias_data);
+  }
+
+  T_ACC *coef1_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C);
+  T_ACC *coef2_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * G);
+  T_ACC *coef3_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * G);
+  // compute fused scales/biases for dx elementwise kernel
+  {
+    auto [TPB, d, f] = simple_calc_block_params(C, C, 1, G);
+    DEBUG("starting bwd scale biases, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
+    compute_bwd_scale_biases<<<dim3(N, f), C / f, sizeof(T_ACC) * 2 * C / f>>>(
+        mean_data, rstd_data, weight_data,
+        xdy_sum_data, dy_sum_data,
+        H, W, C, G,
+        coef1_data, coef2_data, coef3_data);
+  }
+
+  {
+    int vec_elems;
+    if (D % 4 == 0) vec_elems = 4;
+    else if (D % 2 == 0) vec_elems = 2;
+    else vec_elems = 1;
+    auto [TPB, d, f] = simple_calc_block_params(H * W * C, C, 1, G);
+    if (!ELEM_DEBUG && ((H * W * C) % (TPB * 8 * f * vec_elems) == 0)) {
+      const int LOOP_I = 8;
+      const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
+      //DEBUG("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, num blocks (before vectors): %d\n", N, H, W, C, G, D, num_blocks);
+      if (D % 4 == 0)
+        dx_elem_kernel<T, LOOP_I, 4><<<dim3(num_blocks / 4, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+      else if (D % 2 == 0)
+        dx_elem_kernel<T, LOOP_I, 2><<<dim3(num_blocks / 2, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+      else
+        dx_elem_kernel<T, LOOP_I, 1><<<dim3(num_blocks / 1, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+    }
+    else // relatively slow fallback
+      dx_elem_kernel<T, 1, 1><<<dim3(N * H * W, f), C / f>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+  }
+
+  c10::cuda::CUDACachingAllocator::raw_delete(xdy_sum_data);
+  c10::cuda::CUDACachingAllocator::raw_delete(dy_sum_data);
+  c10::cuda::CUDACachingAllocator::raw_delete(coef1_data);
+  c10::cuda::CUDACachingAllocator::raw_delete(coef2_data);
+  c10::cuda::CUDACachingAllocator::raw_delete(coef3_data);
 }
 
-std::vector<at::Tensor> gn_nhwc_cuda_bwd(
-    const at::Tensor& dy,
-    const at::Tensor& X,
-    const at::Tensor& mean,
-    const at::Tensor& rstd,
-    const at::Tensor& weight,
-    const int G
-  ) {
-  const int C = X.size(1);
-  at::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
-  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
-  at::Tensor dX = at::empty_like(X_nhwc);
-  at::Tensor dweight = at::empty({C}, X.options());
-  at::Tensor dbias = at::empty({C}, X.options());
-
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-    c10::ScalarType::Half,
-    c10::ScalarType::BFloat16,
-    X.scalar_type(),
-    "group_norm_nhwc_backward", [&]() {
-      run_gn_bwd_kernels<scalar_t>(
-          dy_nhwc, X_nhwc,
-          weight, mean, rstd,
-          G,
-          dX, dweight, dbias
-      );
-  });
-  return {dX.permute({0, 3, 1, 2}), dweight, dbias};
-}
+template void run_gn_bwd_kernels<double>(const double *dy_data, const double *X_data, const double *weight_data, const double *mean_data, const double *rstd_data, const int N, const int H, const int W, const int C, const int G, double *dx_data, double *dweight_data, double *dbias_data);
+template void run_gn_bwd_kernels<float>(const float *dy_data, const float *X_data, const float *weight_data, const float *mean_data, const float *rstd_data, const int N, const int H, const int W, const int C, const int G, float *dx_data, float *dweight_data, float *dbias_data);
+template void run_gn_bwd_kernels<c10::Half>(const c10::Half *dy_data, const c10::Half *X_data, const c10::Half *weight_data, const c10::Half *mean_data, const c10::Half *rstd_data, const int N, const int H, const int W, const int C, const int G, c10::Half *dx_data, c10::Half *dweight_data, c10::Half *dbias_data);
+template void run_gn_bwd_kernels<c10::BFloat16>(const c10::BFloat16 *dy_data, const c10::BFloat16 *X_data, const c10::BFloat16 *weight_data, const c10::BFloat16 *mean_data, const c10::BFloat16 *rstd_data, const int N, const int H, const int W, const int C, const int G, c10::BFloat16 *dx_data, c10::BFloat16 *dweight_data, c10::BFloat16 *dbias_data);

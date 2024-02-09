@@ -1,7 +1,8 @@
-#include <torch/extension.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/empty.h>
 #include <ATen/Tensor.h>
+#include <torch/extension.h>
+#include "gn_kernel.h"
 
 void GroupNormKernelImpl(
     const at::Tensor& X,
@@ -30,13 +31,6 @@ void GroupNormBackwardKernelImpl(
     at::Tensor& dgamma,
     at::Tensor& dbeta);
 
-std::vector<at::Tensor> gn_nhwc_cuda_fwd_NH_grid(
-    const at::Tensor& X,
-    const at::Tensor& weight,
-    const at::Tensor& bias,
-    const int G,
-    float eps);
-
 std::vector<at::Tensor> gn_nhwc_cuda_bwd(
     const at::Tensor& dY,
     const at::Tensor& X,
@@ -52,11 +46,33 @@ std::vector<at::Tensor> gn_nhwc_fwd_NH_grid(
     const at::Tensor weight,
     const at::Tensor bias,
     const int G,
-    float eps) {
+    double eps) {
   CHECK_CUDA(X);
   CHECK_CUDA(weight);
   CHECK_CUDA(bias);
-  return gn_nhwc_cuda_fwd_NH_grid(X, weight, bias, G, eps);
+  const int N = X.size(0);
+  const int C = X.size(1);
+  const int H = X.size(2);
+  const int W = X.size(3);
+
+  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  at::Tensor X_out = at::empty_like(X_nhwc);
+  at::Tensor means = at::empty({N, G}, weight.options());
+  at::Tensor rstds = at::empty({N, G}, weight.options());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+    at::ScalarType::Half,
+    at::ScalarType::BFloat16,
+    X.scalar_type(),
+    "group_norm_nhwc_forward_NH_grid", [&]() {
+    NH_gn_fwd<scalar_t>(
+        X_nhwc.const_data_ptr<scalar_t>(),
+        weight.const_data_ptr<scalar_t>(), bias.const_data_ptr<scalar_t>(),
+        N, H, W, C, G, static_cast<scalar_t>(eps),
+        X_out.mutable_data_ptr<scalar_t>(), means.mutable_data_ptr<scalar_t>(), rstds.mutable_data_ptr<scalar_t>()
+    );
+  });
+  return {X_out.permute({0, 3, 1, 2}), means, rstds};
 }
 
 std::vector<at::Tensor> gn_nhwc_bwd(
@@ -71,10 +87,30 @@ std::vector<at::Tensor> gn_nhwc_bwd(
   CHECK_CUDA(weight);
   CHECK_CUDA(means);
   CHECK_CUDA(rstds);
-  at::Tensor dX = at::empty_like(X);
-  at::Tensor dgamma = at::empty_like(weight);
-  at::Tensor dbeta = at::empty_like(weight);
-  return gn_nhwc_cuda_bwd(dy, X, means, rstds, weight, G);
+
+  const int N = X.size(0);
+  const int C = X.size(1);
+  const int H = X.size(2);
+  const int W = X.size(3);
+  at::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
+  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  at::Tensor dX = at::empty_like(X_nhwc);
+  at::Tensor dweight = at::empty({C}, X.options());
+  at::Tensor dbias = at::empty({C}, X.options());
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+    c10::ScalarType::Half,
+    c10::ScalarType::BFloat16,
+    X.scalar_type(),
+    "group_norm_nhwc_backward", [&]() {
+      run_gn_bwd_kernels<scalar_t>(
+      dy_nhwc.const_data_ptr<scalar_t>(), X_nhwc.const_data_ptr<scalar_t>(),
+      weight.const_data_ptr<scalar_t>(), means.const_data_ptr<scalar_t>(), rstds.const_data_ptr<scalar_t>(),
+      N, H, W, C, G,
+      dX.mutable_data_ptr<scalar_t>(), dweight.mutable_data_ptr<scalar_t>(), dbias.mutable_data_ptr<scalar_t>()
+      );
+  });
+  return {dX.permute({0, 3, 1, 2}), dweight, dbias};
 }
 
 std::vector<at::Tensor> gn_nchw_forward(
@@ -82,7 +118,7 @@ std::vector<at::Tensor> gn_nchw_forward(
     const at::Tensor weight,
     const at::Tensor bias,
     const int G,
-    float eps) {
+    double eps) {
   CHECK_CUDA(X);
   CHECK_CUDA(weight);
   CHECK_CUDA(bias);

@@ -19,7 +19,7 @@ gn_op = load(
             '-lineinfo', # useful for profiling
             ],
         extra_cflags=[
-            '-O3', # needed or else GN NCHW from source is slower than nn.GroupNorm
+            '-Ofast', # needed or else GN NCHW from source is slower than nn.GroupNorm
             '-funroll-all-loops',
             '-march=native',
             ], 
@@ -28,19 +28,8 @@ gn_op = load(
 
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
-    def choose_kernel(X: torch.Tensor, G: int):
-        return gn_op.fwd_NH_grid
-        #if X.shape[1] / G * X.shape[2] * X.shape[3] <= 8192: # and weight.dtype in (torch.bfloat16, torch.half):
-        #    #print('fs', X.shape)
-        #    return gn_op.fwd_fused
-        #else:
-        #    #print('NH', X.shape)
-        #    return gn_op.fwd_NH_grid
-
-    @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
-        fwd_fn = GN_NHWC_Func.choose_kernel(X, G)
-        X_out, means, rstds = fwd_fn(X, weight, bias, G, eps)
+        X_out, means, rstds = gn_op.fwd_NH_grid(X, weight, bias, G, eps)
         ctx.save_for_backward(X, weight, means, rstds, torch.Tensor([G]))
         return X_out
 
@@ -93,18 +82,18 @@ class GN_NCHW(nn.GroupNorm):
 
     def forward(self, x):
         if self.affine:
-            return GN_NCHW_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
+            return GN_NCHW_Func.apply(x.contiguous(), self.weight, self.bias, self.num_groups, self.eps)
         else:
             w = torch.ones((self.num_channels,), device=x.device, dtype=x.dtype)
             b = torch.zeros((self.num_channels,), device=x.device, dtype=x.dtype)
-            return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
+            return GN_NCHW_Func.apply(x.contiguous(), w, b, self.num_groups, self.eps)
 
 if __name__ == '__main__':
+    DTYPE = torch.double
     DTYPE = torch.bfloat16
     DTYPE = torch.float
-    DTYPE = torch.double
     print('DTYPE:', DTYPE)
-    MODE = 'check' # can be 'check', 'bench', other modes do both
+    MODE = 'bench' # can be 'check', 'bench', other modes do both
     CHECK_PROF = False
 
     if MODE != 'bench':
@@ -115,6 +104,12 @@ if __name__ == '__main__':
         #itertools.product(DTYPEs, Bs, Rs, Cs)
 
         for B, R, C, G in (
+            (1, 1024, 64, 32),
+            (1, 640, 64, 32),
+            (1, 257, 64, 32),
+            (1, 256, 64, 32),
+            (1, 512, 64, 32),
+            (1, 512, 96, 32),
             (1, 64, 960, 32),
             (1, 64, 640, 32),
             (1, 64, 256, 32),
@@ -122,6 +117,7 @@ if __name__ == '__main__':
             (2, 32, 1280, 32),
             (1, 64, 320, 32),
             (1, 32, 960, 32),
+            (1, 16, 2560, 32),
             (1, 16, 2560, 32),
             (1, 32, 640, 32),
             (1, 16, 1920, 32),
@@ -132,7 +128,11 @@ if __name__ == '__main__':
             (1, 8, 1280, 32),
 
             (1, 512, 64, 32),
+            (1, 128, 256, 32),
             (1, 64, 512, 32),
+            (4, 512, 64, 32),
+            (4, 128, 256, 32),
+            (4, 64, 512, 32),
             (1, 64, 256, 32),
             (2, 64, 128, 32),
             (2, 32, 128, 32),
@@ -141,7 +141,11 @@ if __name__ == '__main__':
             (1, 4, 512, 32),
             (2, 4, 256, 32),
             (1, 4, 256, 32),
+            (8, 64, 1024, 32),
             (13, 65, 961, 31),
+            (3, 5, 31, 31),
+            (3, 5, 32, 32),
+            (4, 4, 32, 32),
             (2, 65, 128, 32),
             (1, 3, 6, 2),
         ):
@@ -152,6 +156,7 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()
             print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
             x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 1000
+            #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True)/R/R/C/B-0.5 #* 1000
             torch.random.manual_seed(0)
 
             gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
@@ -164,46 +169,56 @@ if __name__ == '__main__':
                 g2sum = g2.sum()
                 g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
             else:
-                gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
+                gn1 = nn.GroupNorm(G, C).double().cuda()
+                gn3 = GN_NCHW(G, C).cuda().to(DTYPE)
                 with torch.no_grad():
-                    w = torch.randn((C,)) #* 1000
-                    b = torch.randn((C,)) #* 1000
-                    gn1.weight.copy_(w)
-                    gn1.bias.copy_(b)
-                    gn2.weight.copy_(w)
-                    gn2.bias.copy_(b)
-                g1 = gn1(x.contiguous())
+                    w = torch.randn((C,), dtype=DTYPE) #* 1000
+                    b = torch.randn((C,), dtype=DTYPE) #* 1000
+                    gn1.weight.copy_(w.detach().double())
+                    gn1.bias.copy_(b.detach().double())
+                    gn2.weight.copy_(w.detach())
+                    gn2.bias.copy_(b.detach())
+                    gn3.weight.copy_(w.detach())
+                    gn3.bias.copy_(b.detach())
+                g1 = gn1(x.double())
                 g2 = gn2(x)
+                g3 = gn3(x)
                 rand_dy = torch.rand_like(g2)
                 g1sum = (g1 * rand_dy).sum()
                 g2sum = (g2 * rand_dy).sum()
+                g3sum = (g3 * rand_dy).sum()
 
-                def print_err(act1, act2, left_pad=0):
+                def print_err(act_double, act_testing, act_ref, left_pad=0):
                     lpad = ' ' * left_pad
-                    if (act1 - act2).abs().mean() > 1e-5:
-                        print(f'{lpad}{act1 - act2}')
-                        print(f'{lpad}{(act1 - act2).abs().mean()}')
+                    testing_err = (act_double - act_testing).abs().mean()
+                    ref_err = (act_double - act_ref).abs().mean()
+                    if testing_err / ref_err > 2 and testing_err > 1e-6:
+                        print(f'{lpad}{act_double - act_testing}')
+                        print(f'{lpad}Your error: {testing_err}, expected error: {ref_err}')
                     else:
-                        print(f'{lpad}No difference found')
+                        print(f'{lpad}Negligible difference (testing err: {testing_err:.2e}, ref err: {ref_err:.2e}) found')
 
                 print('  FORWARD')
-                print_err(g1, g2, 4)
+                print_err(g1, g2, g3, 4)
 
                 print('  BACKWARD')
                 print('    wrt weight')
                 g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
                 g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
-                print_err(g1_grad_wrt_w, g2_grad_wrt_w, 6)
+                g3_grad_wrt_w = torch.autograd.grad(g3sum, gn3.weight, retain_graph=True)[0]
+                print_err(g1_grad_wrt_w, g2_grad_wrt_w, g3_grad_wrt_w, 6)
 
                 print('    wrt bias')
                 g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
                 g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
-                print_err(g1_grad_wrt_b, g2_grad_wrt_b, 6)
+                g3_grad_wrt_b = torch.autograd.grad(g3sum, gn3.bias, retain_graph=True)[0].reshape((gn3.bias.numel(),))
+                print_err(g1_grad_wrt_b, g2_grad_wrt_b, g3_grad_wrt_b, 6)
 
                 print('    wrt X')
                 g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
                 g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-                print_err(g1_grad_wrt_x, g2_grad_wrt_x, 6)
+                g3_grad_wrt_x = torch.autograd.grad(g3sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
+                print_err(g1_grad_wrt_x, g2_grad_wrt_x, g3_grad_wrt_x, 6)
 
     if MODE != 'check':
         NSEC = 1 # number of seconds that each kernel runs for on a certain input
@@ -213,7 +228,7 @@ if __name__ == '__main__':
         RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
         #NUM_GROUPS = [4, 8, 16, 32, 64, 128]
         NUM_GROUPS = [32]
-        BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
+        BENCH = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
         GN_KERNELS = [
                 #(GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
                 #(GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),

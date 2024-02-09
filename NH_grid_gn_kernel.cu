@@ -1,18 +1,28 @@
-//#include <ATen/cuda/Exceptions.h> // AT_CUDA_CHECK
-#include <ATen/AccumulateType.h> // acc_type
-#include <ATen/ops/empty_like.h>
 #include <ATen/OpMathType.h> // opmath_t
-#include <ATen/ops/empty.h>
-#include <ATen/Dispatch.h> // at_dispatch macro
-#include <ATen/Tensor.h> // torch tensor
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/core/ScalarType.h>
+#include <c10/util/BFloat16.h>
 #include <thrust/pair.h> // thrust::pair
-#include <vector> // std::vector
+#include "gn_kernel.h"
 #include "Welford.h"
 #include "vecs.h"
 #define MAX_THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 #define MAX(a, b) (a > b) ? a : b
 #define MIN(a, b) (a < b) ? a : b
+#define DEBUG(format, args...) if constexpr (0) fprintf(stderr, format, args)
+#define ELEM_DEBUG 0
+#define INT int
+
+template <typename T>
+struct acc_type { using type = float; };
+template <>
+struct acc_type<double> { using type = double; };
+
+typedef struct block_params {
+  int t; // threads per block
+  int d; // dimensionality (number of data rows per threadblock)
+  int f; // factor (number of different threadblocks needed to represent one row of data) 
+} block_params_t;
 
 template <typename T>
 __global__ void
@@ -23,8 +33,8 @@ compute_scale_biases(
         const T* bias,   // (C)
         const int G,
         const int C,
-        at::acc_type<T, true>* a,            // (N, C)
-        at::acc_type<T, true>* b             // (N, C)
+        typename acc_type<T>::type* a,            // (N, C)
+        typename acc_type<T>::type* b             // (N, C)
   ) {
   // (N, f), (TPB)
   const int D = C / G;
@@ -32,7 +42,7 @@ compute_scale_biases(
   const int g = c / D;
   const int nc = blockIdx.x * C + c;
   const int ng = blockIdx.x * G + g;
-  const at::acc_type<T, true> a_nc = rstds[ng] * weight[c];
+  const acc_type<T> a_nc = rstds[ng] * weight[c];
   a[nc] = a_nc;
   b[nc] = -means[ng] * a_nc + bias[c];
 }
@@ -69,6 +79,28 @@ inline gelu_tanh(T x) {
   return opmath_t(0.5) * static_cast<opmath_t>(x) * (opmath_t(1) + c10::cuda::compat::tanh(inner));
 }
 
+inline block_params_t simple_calc_block_params(int ideal_num_threads, int threads_per_row, int d_preferred_divisibility = 1, int f_divides = -1) {
+  /*
+  d_preferred_divisibility: if possible, make d a multiple of d_preferred divisibilty (useful for kernels which require inputs to be divisible by the number of threads per block e.g. elementwise kernel)
+  f_divides: parameter if user needs to explicitly specify a stricter requirement on the divisibility of the number of threads per block
+    - e.g. fwd with C = 2560, G = 32, TPB = 480 wouldn't work since that means 32 groups are split over f=5 blocks (5.333 groups per block)
+    - e.g. fwd with C = 2560, G = 32, TPB = 320 would work since that means 32 groups are split over f=8 blocks (4 groups per block), you could say that f divides 32 (f_divides=32)
+  */
+  int TPB, d = 1, f = 1;
+  f_divides = f_divides == -1 ? threads_per_row : f_divides;
+  TPB = MIN(MAX_THREADS_PER_BLOCK, ideal_num_threads);
+  if (threads_per_row < TPB)
+    if (TPB / threads_per_row / d_preferred_divisibility != 0)
+      d = d_preferred_divisibility * (TPB / threads_per_row / d_preferred_divisibility); // prefer d being a multiple of d_preferred_divisibility (e.g. for C=96, prefer TPB=38d_preferred_divisibility and not d_preferred_divisibility80) since it makes it more likely that TPB will be able to use the fast elementwise kernel
+    else
+      d = TPB / threads_per_row;
+  else
+    while (f_divides % f != 0 || threads_per_row / f > MAX_THREADS_PER_BLOCK)
+      ++f;
+  TPB = threads_per_row * d / f;
+  return {TPB, d, f};
+}
+
 #define ACT 
 
 template <typename T, int LOOP_I, int vec_elems>
@@ -84,7 +116,7 @@ scale_shift(
     const int G,
     T* y
     ) {
-  using T_ACC = at::acc_type<T, true>;
+  using T_ACC = typename acc_type<T>::type;
   using V = float_vec<T, vec_elems>;
   const int n = (N * blockIdx.x) / gridDim.x;
   const int c = (blockIdx.y * blockDim.x + threadIdx.x) % (C / vec_elems);
@@ -149,7 +181,7 @@ NH_compute_stats_pt1(
     const int W,
     const int C,
     const int G,
-    WelfordData<at::acc_type<T, true>, int> *welford_data
+    WelfordData<typename acc_type<T>::type, INT> *welford_data
   ) {
   /*
      C <= MAX_THREADS_PER_BLOCK (Kernel 1):
@@ -169,9 +201,9 @@ NH_compute_stats_pt1(
        shmem reduction: (TPB,) -view-> (1, G/f, D) -permute-> (1, D, G/f) -reduce-> G/f
        output buffer: (N, f, G/f, H)
   */
-  using T_ACC = at::acc_type<T, true>;
-  using WelfordType = WelfordData<T_ACC, int>;
-  using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  using T_ACC = typename acc_type<T>::type;
+  using WelfordType = WelfordData<T_ACC, INT>;
+  using WelfordOp = WelfordOps<T_ACC, T_ACC, INT, thrust::pair<T_ACC, T_ACC>>;
   const int TPB = blockDim.y * blockDim.x;
   const int d = blockDim.y;
 
@@ -224,6 +256,7 @@ NH_compute_stats_pt1(
   }
 
   if (tid < gf) {
+#pragma unroll
     for (int i = 1; i < reduce_n; ++i)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + i * gf]);
 
@@ -239,16 +272,16 @@ NH_compute_stats_pt1(
 template <typename T>
 __global__ void
 NH_compute_stats_pt2(
-    WelfordData<at::acc_type<T, true>, int> *welford_data,
+    WelfordData<typename acc_type<T>::type, INT> *welford_data,
     const int H,
     const int G,
-    const float eps,
+    const T eps,
     T* means,
     T* rstds
   ) {
-  using T_ACC = at::acc_type<T, true>;
-  using WelfordType = WelfordData<T_ACC, int>;
-  using WelfordOp = WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  using T_ACC = typename acc_type<T>::type;
+  using WelfordType = WelfordData<T_ACC, INT>;
+  using WelfordOp = WelfordOps<T_ACC, T_ACC, INT, thrust::pair<T_ACC, T_ACC>>;
   /*
      griddim: (x=N, y=G); blockdim: (x=H)
       d = num. spatial elements (from H dimension) each thread-block processes in parallel
@@ -264,12 +297,24 @@ NH_compute_stats_pt2(
   // shmem reduction
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[MAX_THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
+  WelfordType val(0, 0, 0, 0);
 
-  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  vals_reduced[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
+  const int f = H / TPB;
+  for (int i = 0 ; i < f; ++i) {
+    int idx = 0;
+    idx += blockIdx.x * G * H;
+    idx += blockIdx.y * H;
+    idx += i * H / f;
+    idx += threadIdx.x;
+    val = welford_op.combine(val, welford_data[idx]);
+  }
+
+  const int tid = threadIdx.x;
+  //vals_reduced[tid] = welford_data[blockIdx.x * G * H + blockIdx.y * H + threadIdx.x];
+  vals_reduced[tid] = val;
   __syncthreads();
 
-  // next lowest power of 2 (AKA half of the next highest power of 2) - https://graphics.stanford.edu/%7Eseander/bithacks.html#RoundUpPowerOf2
+  // next lowest power of 2 (AKA half of TPB's next highest power of 2 (or TPB if TPB is a power of 2)) - https://graphics.stanford.edu/%7Eseander/bithacks.html#RoundUpPowerOf2
   int start_stride = TPB - 1;
   start_stride |= start_stride >> 1;
   start_stride |= start_stride >> 2;
@@ -279,7 +324,7 @@ NH_compute_stats_pt2(
   start_stride = (start_stride + 1) >> 1;
 
   // doing the first iteration outside the loop because of the extra condition regarding inputs with non-power-of-2 heights
-  if (tid < start_stride && tid + start_stride < H)
+  if (tid < start_stride && tid + start_stride < H / f)
     vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + start_stride]);
   __syncthreads();
 #pragma unroll
@@ -298,124 +343,77 @@ NH_compute_stats_pt2(
     out_idx += blockIdx.y; // dim 1, G/f stride
     means[out_idx] = mean;
     rstds[out_idx] = rsqrt(var + static_cast<T_ACC>(eps));
+    //if (blockIdx.x < 2 && blockIdx.y < 2)
+    //  printf("N: %d, G: %d, mean: %f, var: %f\n", blockIdx.x, blockIdx.y, mean, var);
   }
 }
-
-#define TENSORIT_DEBUG 0
-#include <ATen/native/cuda/Loops.cuh>
 
 template <typename T>
 void NH_gn_fwd(
-    const at::Tensor& X,
-    const at::Tensor& weight,
-    const at::Tensor& bias,
+    const T *X_data,
+    const T *weight_data,
+    const T *bias_data,
+    const int N,
+    const int H,
+    const int W,
+    const int C,
     const int G,
     T eps,
-    at::Tensor& Y,
-    at::Tensor& means,
-    at::Tensor& rstds) {
-  const T* X_data = X.const_data_ptr<T>();
-  T* mean_data = means.mutable_data_ptr<T>();
-  T* rstd_data = rstds.mutable_data_ptr<T>();
-
-  const int N = X.size(0);
-  const int H = X.size(1);
-  const int W = X.size(2);
-  const int C = X.size(3);
-
-  using T_ACC = at::acc_type<T, true>;
-  using WelfordType = WelfordData<T_ACC, int>;
-  at::Tensor welford_tensor = at::empty({N, G, H, sizeof(WelfordType)}, X.options().dtype(at::kByte));
-  WelfordType *welford_data = reinterpret_cast<WelfordType*>(welford_tensor.mutable_data_ptr());
+    T *Y_data,
+    T *mean_data,
+    T *rstd_data) {
+  using T_ACC = typename acc_type<T>::type;
+  using WelfordType = WelfordData<T_ACC, INT>;
+  WelfordType *welford_data = (WelfordType*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(WelfordType) * N * G * H);
   
-  int TPB, d = 1, f = 1;
-  TPB = MIN(MAX_THREADS_PER_BLOCK, W * C);
-  if (C < TPB)
-    if (TPB / C / 4 != 0)
-      d = 4 * (TPB / C / 4); // prefer d being a multiple of 4 (e.g. for C=96, prefer TPB=384 and not 480) since it makes it more likely that TPB will be able to use the fast elementwise kernel
-    else
-      d = TPB / C;
-  else
-    while (C % f != 0 || C / f > MAX_THREADS_PER_BLOCK || G % f != 0)
-      ++f;
-  TPB = C * d / f;
-  //printf("starting compute_stats, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", N, H, W, C, G, C / G, TPB, d, f, G / f);
-  NH_compute_stats_pt1<<<dim3(N, H, f), dim3(TPB / d, d)>>>(
-      X_data,
-      H, W, C, G, 
-      welford_data
-  );
-
-  NH_compute_stats_pt2<<<dim3(N, G), H>>>(
-      welford_data,
-      H, G, eps,
-      mean_data, rstd_data
-  );
-
-  const int LOOP_I = 8;
-  const int D = C / G;
-  int vec_elems;
-  if (D % 4 == 0) vec_elems = 4;
-  else if (D % 2 == 0) vec_elems = 2;
-  else vec_elems = 1;
-  if (!TENSORIT_DEBUG && ((H * W * C) % (TPB * LOOP_I * f * vec_elems) == 0)) {
-    const T* weight_data = weight.const_data_ptr<T>();
-    const T* bias_data = bias.const_data_ptr<T>();
-    T* Y_data = Y.mutable_data_ptr<T>();
-
-    //printf("starting scale_shift N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, G/f: %d,\n", N, H, W, C, G, C / G, TPB, f, G / f);
-    const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
-    if (vec_elems == 4)
-      scale_shift<T, LOOP_I, 4><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
-    else if (vec_elems == 2)
-      scale_shift<T, LOOP_I, 2><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
-    else
-      scale_shift<T, LOOP_I, 1><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+  {
+    auto [TPB, d, f] = simple_calc_block_params(W * C, C, 1, G);
+    DEBUG("starting compute_stats 1, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", (int)N, (int)H, (int)W, (int)C, (int)G, (int)(C / G), (int)TPB, (int)d, (int)f, (int)(G / f));
+    NH_compute_stats_pt1<<<dim3(N, H, f), dim3(TPB / d, d)>>>(
+        X_data,
+        H, W, C, G, 
+        welford_data
+    );
   }
-  else {
-    //printf("using TensorIterator, N: %d H %d W %d C %d G %d TPB %d f %d\n", N, H, W, C, G, TPB, f);
-    at::TensorIterator iter = at::TensorIteratorConfig()
-      .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC
-      .resize_outputs(false)
-      .add_owned_output(Y.view({N, H * W, G, D}))
-      .add_owned_input(X.view({N, H * W, G, D}))
-      .add_owned_input(means.view({N, 1, G, 1}))
-      .add_owned_input(rstds.view({N, 1, G, 1}))
-      .add_owned_input(weight.view({1, 1, G, D}))
-      .add_owned_input(bias.view({1, 1, G, D}))
-      .build();
-     
-    at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T weight, T bias) -> T {
-      return (static_cast<T_ACC>(x) - mean) * rstd * weight + bias;
-    });
+
+  {
+    auto [TPB, d, f] = simple_calc_block_params(H, H);
+    DEBUG("starting compute_stats 2, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", (int)N, (int)H, (int)W, (int)C, (int)G, (int)(C / G), (int)TPB, (int)d, (int)f, (int)(G / f));
+    NH_compute_stats_pt2<<<dim3(N, G), H / f>>>(
+        welford_data,
+        H, G, eps,
+        mean_data, rstd_data
+    );
   }
-  AT_CUDA_CHECK(cudaGetLastError());
+
+  c10::cuda::CUDACachingAllocator::raw_delete(welford_data);
+
+  {
+    const int D = C / G;
+    int vec_elems;
+    if (D % 4 == 0) vec_elems = 4;
+    else if (D % 2 == 0) vec_elems = 2;
+    else vec_elems = 1;
+    auto [TPB, d, f] = simple_calc_block_params(H * W * C / 8 / vec_elems, C);
+    if (!ELEM_DEBUG && ((H * W * C) % (TPB * 8 * f * vec_elems) == 0)) {
+      DEBUG("starting scale_shift, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", (int)N, (int)H, (int)W, (int)C, (int)G, (int)(C / G), (int)TPB, (int)d, (int)f, (int)(G / f));
+      const int LOOP_I = 8;
+      const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
+      if (vec_elems == 4)
+        scale_shift<T, LOOP_I, 4><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 2)
+        scale_shift<T, LOOP_I, 2><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else
+        scale_shift<T, LOOP_I, 1><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+    }
+    else {// relatively slow fallback
+      DEBUG("SLOW FALLBACK, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", (int)N, (int)H, (int)W, (int)C, (int)G, (int)(C / G), (int)TPB, (int)d, (int)f, (int)(G / f));
+      scale_shift<T, 1, 1><<<dim3(N * H * W, f), C / f>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+    }
+  }
 }
 
-std::vector<at::Tensor> gn_nhwc_cuda_fwd_NH_grid(
-    const at::Tensor& X,
-    const at::Tensor& weight,
-    const at::Tensor& bias,
-    const int G,
-    float eps) {
-  const int N = X.size(0);
-
-  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
-  at::Tensor X_out = at::empty_like(X_nhwc);
-  at::Tensor means = at::empty({N, G}, weight.options());
-  at::Tensor rstds = at::empty({N, G}, weight.options());
-
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-    at::ScalarType::Half,
-    at::ScalarType::BFloat16,
-    X.scalar_type(),
-    "group_norm_nhwc_forward_NH_grid", [&]() {
-      NH_gn_fwd<scalar_t>(
-          X_nhwc,
-          weight, bias,
-          G, eps,
-          X_out, means, rstds
-      );
-  });
-  return {X_out.permute({0, 3, 1, 2}), means, rstds};
-}
+template void NH_gn_fwd<float>(const float *X_data, const float *weight_data, const float *bias_data, const int N, const int h, const int W, const int C, const int G, float eps, float *Y_data, float *mean_data, float *rstd_data);
+template void NH_gn_fwd<double>(const double *X_data, const double *weight_data, const double *bias_data, const int N, const int h, const int W, const int C, const int G, double eps, double *Y_data, double *mean_data, double *rstd_data);
+template void NH_gn_fwd<c10::Half>(const c10::Half *X_data, const c10::Half *weight_data, const c10::Half *bias_data, const int N, const int h, const int W, const int C, const int G, c10::Half eps, c10::Half *Y_data, c10::Half *mean_data, c10::Half *rstd_data);
+template void NH_gn_fwd<c10::BFloat16>(const c10::BFloat16 *X_data, const c10::BFloat16 *weight_data, const c10::BFloat16 *bias_data, const int N, const int h, const int W, const int C, const int G, c10::BFloat16 eps, c10::BFloat16 *Y_data, c10::BFloat16 *mean_data, c10::BFloat16 *rstd_data);
