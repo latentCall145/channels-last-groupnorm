@@ -41,7 +41,7 @@ std::vector<at::Tensor> gn_nhwc_cuda_bwd(
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 
-std::vector<at::Tensor> gn_nhwc_fwd_NH_grid(
+std::vector<at::Tensor> gn_nhwc_fwd(
     const at::Tensor X,
     const at::Tensor weight,
     const at::Tensor bias,
@@ -64,8 +64,8 @@ std::vector<at::Tensor> gn_nhwc_fwd_NH_grid(
     at::ScalarType::Half,
     at::ScalarType::BFloat16,
     X.scalar_type(),
-    "group_norm_nhwc_forward_NH_grid", [&]() {
-    NH_gn_fwd<scalar_t>(
+    "group_norm_nhwc_forward", [&]() {
+    run_gn_fwd_kernels<scalar_t>(
         X_nhwc.const_data_ptr<scalar_t>(),
         weight.const_data_ptr<scalar_t>(), bias.const_data_ptr<scalar_t>(),
         N, H, W, C, G, static_cast<scalar_t>(eps),
@@ -169,7 +169,7 @@ std::vector<at::Tensor> gn_nchw_backward(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("fwd_NH_grid", &gn_nhwc_fwd_NH_grid, "GN NHWC forward (NH grid)");
+  m.def("fwd", &gn_nhwc_fwd, "GN NHWC forward (NH grid)");
   m.def("bwd", &gn_nhwc_bwd, "GN NHWC backward");
   m.def("nchwforward", &gn_nchw_forward, "GN NCHW forward");
   m.def("nchwbackward", &gn_nchw_backward, "GN NCHW backward");

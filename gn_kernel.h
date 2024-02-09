@@ -3,7 +3,7 @@
 #define FWD_GN_KERNEL_H
 
 template <typename T>
-void NH_gn_fwd(
+void run_gn_fwd_kernels(
     const T *X_data,
     const T *weight_data,
     const T *bias_data,

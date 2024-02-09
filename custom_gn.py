@@ -19,7 +19,7 @@ gn_op = load(
             '-lineinfo', # useful for profiling
             ],
         extra_cflags=[
-            '-Ofast', # needed or else GN NCHW from source is slower than nn.GroupNorm
+            '-O3', # needed or else GN NCHW from source is slower than nn.GroupNorm
             '-funroll-all-loops',
             '-march=native',
             ], 
@@ -29,15 +29,16 @@ gn_op = load(
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
-        X_out, means, rstds = gn_op.fwd_NH_grid(X, weight, bias, G, eps)
-        ctx.save_for_backward(X, weight, means, rstds, torch.Tensor([G]))
+        X_out, means, rstds = gn_op.fwd(X, weight, bias, G, eps)
+        ctx.save_for_backward(X, weight, means, rstds)
+        ctx.G = G
         return X_out
 
     @staticmethod
     def backward(ctx, dy):
         dy = dy.contiguous(memory_format=torch.channels_last)
-        X, weight, means, rstds, G = ctx.saved_tensors 
-        dx, dgamma, dbeta = gn_op.bwd(dy, X, weight, means, rstds, int(G))
+        X, weight, means, rstds = ctx.saved_tensors 
+        dx, dgamma, dbeta = gn_op.bwd(dy, X, weight, means, rstds, ctx.G)
         return dx, dgamma, dbeta, None, None
 
 class GN_NHWC(nn.GroupNorm):
@@ -66,14 +67,15 @@ class GN_NCHW_Func(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
         X_out, means, rstds = gn_op.nchwforward(X, weight, bias, G, eps)
-        ctx.save_for_backward(X, weight, means, rstds, torch.Tensor([G]))
+        ctx.save_for_backward(X, weight, means, rstds)
+        ctx.G = G
         return X_out
 
     @staticmethod
     def backward(ctx, dy):
         dy = dy.contiguous()
-        X, weight, means, rstds, G = ctx.saved_tensors 
-        dx, dgamma, dbeta = gn_op.nchwbackward(dy, X, weight, means, rstds, int(G))
+        X, weight, means, rstds = ctx.saved_tensors 
+        dx, dgamma, dbeta = gn_op.nchwbackward(dy, X, weight, means, rstds, ctx.G)
         return dx, dgamma, dbeta, None, None
 
 class GN_NCHW(nn.GroupNorm):
@@ -91,9 +93,8 @@ class GN_NCHW(nn.GroupNorm):
 if __name__ == '__main__':
     DTYPE = torch.double
     DTYPE = torch.bfloat16
-    DTYPE = torch.float
     print('DTYPE:', DTYPE)
-    MODE = 'bench' # can be 'check', 'bench', other modes do both
+    MODE = 'check' # can be 'check', 'bench', other modes do both
     CHECK_PROF = False
 
     if MODE != 'bench':
@@ -104,6 +105,25 @@ if __name__ == '__main__':
         #itertools.product(DTYPEs, Bs, Rs, Cs)
 
         for B, R, C, G in (
+            (1, 2, 32, 32),
+            (1, 2, 64, 32),
+            (1, 2, 128, 32),
+            (1, 4, 32, 32),
+            (1, 4, 64, 32),
+            (1, 4, 128, 32),
+            (1, 8, 32, 32),
+            (1, 8, 64, 32),
+            (1, 8, 128, 32),
+            (1, 16, 32, 32),
+            (1, 16, 64, 32),
+            (1, 16, 128, 32),
+            (1, 32, 32, 32),
+            (1, 32, 64, 32),
+            (1, 32, 128, 32),
+            (1, 64, 32, 32),
+            (1, 64, 64, 32),
+            (1, 64, 128, 32),
+
             (1, 1024, 64, 32),
             (1, 640, 64, 32),
             (1, 257, 64, 32),
@@ -160,6 +180,7 @@ if __name__ == '__main__':
             torch.random.manual_seed(0)
 
             gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
+            g = torch.cuda.CUDAGraph()
 
             if CHECK_PROF:
                 #g1 = gn1(x.contiguous())
@@ -170,7 +191,7 @@ if __name__ == '__main__':
                 g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
             else:
                 gn1 = nn.GroupNorm(G, C).double().cuda()
-                gn3 = GN_NCHW(G, C).cuda().to(DTYPE)
+                gn3 = nn.GroupNorm(G, C).cuda().to(DTYPE)
                 with torch.no_grad():
                     w = torch.randn((C,), dtype=DTYPE) #* 1000
                     b = torch.randn((C,), dtype=DTYPE) #* 1000
@@ -180,13 +201,16 @@ if __name__ == '__main__':
                     gn2.bias.copy_(b.detach())
                     gn3.weight.copy_(w.detach())
                     gn3.bias.copy_(b.detach())
+
+                #with torch.cuda.graph(g):
                 g1 = gn1(x.double())
                 g2 = gn2(x)
                 g3 = gn3(x)
-                rand_dy = torch.rand_like(g2)
+                rand_dy = torch.rand_like(g3)
                 g1sum = (g1 * rand_dy).sum()
                 g2sum = (g2 * rand_dy).sum()
                 g3sum = (g3 * rand_dy).sum()
+                #g.replay()
 
                 def print_err(act_double, act_testing, act_ref, left_pad=0):
                     lpad = ' ' * left_pad

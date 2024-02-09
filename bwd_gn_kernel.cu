@@ -315,7 +315,7 @@ dx_elem_kernel(
   }
 }
 
-inline block_params_t simple_calc_block_params(int ideal_num_threads, int threads_per_row, int d_preferred_divisibility = 1, int f_divides = -1) {
+inline block_params_t calc_block_params(int ideal_num_threads, int threads_per_row, int d_preferred_divisibility = 1, int f_divides = -1) {
   /*
   d_preferred_divisibility: if possible, make d a multiple of d_preferred divisibilty (useful for kernels which require inputs to be divisible by the number of threads per block e.g. elementwise kernel)
   f_divides: parameter if user needs to explicitly specify a stricter requirement on the divisibility of the number of threads per block
@@ -356,15 +356,16 @@ void run_gn_bwd_kernels(
       T *dbias_data
   ) {
   using T_ACC = typename acc_type<T>::type;
+  cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
   const int D = C / G;
 
   T_ACC* xdy_dy_sum_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C * H * 2);
 
   // sum over W dim
   {
-    auto [TPB, d, f] = simple_calc_block_params(W * C, C, 4, G);
+    auto [TPB, d, f] = calc_block_params(W * C, C, 4, G);
     DEBUG("starting width reduce, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
-    width_reduce<<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB>>>(
+    width_reduce<<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB, cuda_stream>>>(
         dy_data, X_data, 
         H, W, C,
         xdy_dy_sum_data);
@@ -374,10 +375,10 @@ void run_gn_bwd_kernels(
   T_ACC* dy_sum_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C);
   // sum over H dim
   {
-    auto [TPB, d, f] = simple_calc_block_params(2 * H, 2);
+    auto [TPB, d, f] = calc_block_params(2 * H, 2);
     DEBUG("starting height reduce, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
     //height_reduce<<<dim3(N, C), TPB, sizeof(T_ACC) * host_next_power_of_2(TPB)>>>(
-    height_reduce<<<dim3(N, C), TPB, sizeof(T_ACC) * TPB>>>(
+    height_reduce<<<dim3(N, C), TPB, sizeof(T_ACC) * TPB, cuda_stream>>>(
         xdy_dy_sum_data,
         H, C,
         xdy_sum_data, dy_sum_data);
@@ -386,9 +387,9 @@ void run_gn_bwd_kernels(
 
   // compute weight/bias grads
   {
-    auto [TPB, d, f] = simple_calc_block_params(C, C, 1, G);
+    auto [TPB, d, f] = calc_block_params(C, C, 1, G);
     DEBUG("starting compute dweight dbias, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
-    compute_dweight_dbias<<<f, C / f>>>(
+    compute_dweight_dbias<<<f, C / f, 0, cuda_stream>>>(
         mean_data, rstd_data,
         xdy_sum_data, dy_sum_data,
         N, C, G,
@@ -400,9 +401,9 @@ void run_gn_bwd_kernels(
   T_ACC *coef3_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * G);
   // compute fused scales/biases for dx elementwise kernel
   {
-    auto [TPB, d, f] = simple_calc_block_params(C, C, 1, G);
+    auto [TPB, d, f] = calc_block_params(C, C, 1, G);
     DEBUG("starting bwd scale biases, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
-    compute_bwd_scale_biases<<<dim3(N, f), C / f, sizeof(T_ACC) * 2 * C / f>>>(
+    compute_bwd_scale_biases<<<dim3(N, f), C / f, sizeof(T_ACC) * 2 * C / f, cuda_stream>>>(
         mean_data, rstd_data, weight_data,
         xdy_sum_data, dy_sum_data,
         H, W, C, G,
@@ -414,20 +415,20 @@ void run_gn_bwd_kernels(
     if (D % 4 == 0) vec_elems = 4;
     else if (D % 2 == 0) vec_elems = 2;
     else vec_elems = 1;
-    auto [TPB, d, f] = simple_calc_block_params(H * W * C, C, 1, G);
+    auto [TPB, d, f] = calc_block_params(H * W * C, C, 1, G);
     if (!ELEM_DEBUG && ((H * W * C) % (TPB * 8 * f * vec_elems) == 0)) {
       const int LOOP_I = 8;
       const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
       //DEBUG("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, num blocks (before vectors): %d\n", N, H, W, C, G, D, num_blocks);
       if (D % 4 == 0)
-        dx_elem_kernel<T, LOOP_I, 4><<<dim3(num_blocks / 4, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+        dx_elem_kernel<T, LOOP_I, 4><<<dim3(num_blocks / 4, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
       else if (D % 2 == 0)
-        dx_elem_kernel<T, LOOP_I, 2><<<dim3(num_blocks / 2, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+        dx_elem_kernel<T, LOOP_I, 2><<<dim3(num_blocks / 2, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
       else
-        dx_elem_kernel<T, LOOP_I, 1><<<dim3(num_blocks / 1, f), TPB>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+        dx_elem_kernel<T, LOOP_I, 1><<<dim3(num_blocks / 1, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
     }
     else // relatively slow fallback
-      dx_elem_kernel<T, 1, 1><<<dim3(N * H * W, f), C / f>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
+      dx_elem_kernel<T, 1, 1><<<dim3(N * H * W, f), C / f, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, N, C, G, dx_data);
   }
 
   c10::cuda::CUDACachingAllocator::raw_delete(xdy_sum_data);

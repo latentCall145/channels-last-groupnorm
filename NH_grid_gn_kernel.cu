@@ -79,7 +79,7 @@ inline gelu_tanh(T x) {
   return opmath_t(0.5) * static_cast<opmath_t>(x) * (opmath_t(1) + c10::cuda::compat::tanh(inner));
 }
 
-inline block_params_t simple_calc_block_params(int ideal_num_threads, int threads_per_row, int d_preferred_divisibility = 1, int f_divides = -1) {
+inline block_params_t calc_block_params(int ideal_num_threads, int threads_per_row, int d_preferred_divisibility = 1, int f_divides = -1) {
   /*
   d_preferred_divisibility: if possible, make d a multiple of d_preferred divisibilty (useful for kernels which require inputs to be divisible by the number of threads per block e.g. elementwise kernel)
   f_divides: parameter if user needs to explicitly specify a stricter requirement on the divisibility of the number of threads per block
@@ -101,7 +101,7 @@ inline block_params_t simple_calc_block_params(int ideal_num_threads, int thread
   return {TPB, d, f};
 }
 
-#define ACT 
+#define ACT // silu
 
 template <typename T, int LOOP_I, int vec_elems>
 __global__ void
@@ -175,7 +175,7 @@ scale_shift(
 
 template <typename T>
 __global__ void
-NH_compute_stats_pt1(
+compute_stats_pt1(
     const T* X,
     const int H,
     const int W,
@@ -271,7 +271,7 @@ NH_compute_stats_pt1(
 
 template <typename T>
 __global__ void
-NH_compute_stats_pt2(
+compute_stats_pt2(
     WelfordData<typename acc_type<T>::type, INT> *welford_data,
     const int H,
     const int G,
@@ -349,7 +349,7 @@ NH_compute_stats_pt2(
 }
 
 template <typename T>
-void NH_gn_fwd(
+void run_gn_fwd_kernels(
     const T *X_data,
     const T *weight_data,
     const T *bias_data,
@@ -365,11 +365,15 @@ void NH_gn_fwd(
   using T_ACC = typename acc_type<T>::type;
   using WelfordType = WelfordData<T_ACC, INT>;
   WelfordType *welford_data = (WelfordType*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(WelfordType) * N * G * H);
+  cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
+
+  //cudaError_t err = cudaGetLastError();
+  //if (err != cudaSuccess) {fprintf(stderr, "CUDA kernel failed : %s\n", cudaGetErrorString(err)); exit(-1);}
   
   {
-    auto [TPB, d, f] = simple_calc_block_params(W * C, C, 1, G);
+    auto [TPB, d, f] = calc_block_params(W * C, C, 1, G);
     DEBUG("starting compute_stats 1, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", (int)N, (int)H, (int)W, (int)C, (int)G, (int)(C / G), (int)TPB, (int)d, (int)f, (int)(G / f));
-    NH_compute_stats_pt1<<<dim3(N, H, f), dim3(TPB / d, d)>>>(
+    compute_stats_pt1<<<dim3(N, H, f), dim3(TPB / d, d), 0, cuda_stream>>>(
         X_data,
         H, W, C, G, 
         welford_data
@@ -377,16 +381,14 @@ void NH_gn_fwd(
   }
 
   {
-    auto [TPB, d, f] = simple_calc_block_params(H, H);
+    auto [TPB, d, f] = calc_block_params(H, H);
     DEBUG("starting compute_stats 2, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", (int)N, (int)H, (int)W, (int)C, (int)G, (int)(C / G), (int)TPB, (int)d, (int)f, (int)(G / f));
-    NH_compute_stats_pt2<<<dim3(N, G), H / f>>>(
+    compute_stats_pt2<<<dim3(N, G), H / f, 0, cuda_stream>>>(
         welford_data,
         H, G, eps,
         mean_data, rstd_data
     );
   }
-
-  c10::cuda::CUDACachingAllocator::raw_delete(welford_data);
 
   {
     const int D = C / G;
@@ -394,26 +396,28 @@ void NH_gn_fwd(
     if (D % 4 == 0) vec_elems = 4;
     else if (D % 2 == 0) vec_elems = 2;
     else vec_elems = 1;
-    auto [TPB, d, f] = simple_calc_block_params(H * W * C / 8 / vec_elems, C);
+    auto [TPB, d, f] = calc_block_params(H * W * C / 8 / vec_elems, C);
     if (!ELEM_DEBUG && ((H * W * C) % (TPB * 8 * f * vec_elems) == 0)) {
       DEBUG("starting scale_shift, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", (int)N, (int)H, (int)W, (int)C, (int)G, (int)(C / G), (int)TPB, (int)d, (int)f, (int)(G / f));
       const int LOOP_I = 8;
       const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
       if (vec_elems == 4)
-        scale_shift<T, LOOP_I, 4><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+        scale_shift<T, LOOP_I, 4><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
       else if (vec_elems == 2)
-        scale_shift<T, LOOP_I, 2><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+        scale_shift<T, LOOP_I, 2><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
       else
-        scale_shift<T, LOOP_I, 1><<<dim3(num_blocks / vec_elems, f), TPB>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+        scale_shift<T, LOOP_I, 1><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
     }
     else {// relatively slow fallback
       DEBUG("SLOW FALLBACK, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", (int)N, (int)H, (int)W, (int)C, (int)G, (int)(C / G), (int)TPB, (int)d, (int)f, (int)(G / f));
-      scale_shift<T, 1, 1><<<dim3(N * H * W, f), C / f>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      scale_shift<T, 1, 1><<<dim3(N * H * W, f), C / f, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
     }
   }
+
+  c10::cuda::CUDACachingAllocator::raw_delete(welford_data);
 }
 
-template void NH_gn_fwd<float>(const float *X_data, const float *weight_data, const float *bias_data, const int N, const int h, const int W, const int C, const int G, float eps, float *Y_data, float *mean_data, float *rstd_data);
-template void NH_gn_fwd<double>(const double *X_data, const double *weight_data, const double *bias_data, const int N, const int h, const int W, const int C, const int G, double eps, double *Y_data, double *mean_data, double *rstd_data);
-template void NH_gn_fwd<c10::Half>(const c10::Half *X_data, const c10::Half *weight_data, const c10::Half *bias_data, const int N, const int h, const int W, const int C, const int G, c10::Half eps, c10::Half *Y_data, c10::Half *mean_data, c10::Half *rstd_data);
-template void NH_gn_fwd<c10::BFloat16>(const c10::BFloat16 *X_data, const c10::BFloat16 *weight_data, const c10::BFloat16 *bias_data, const int N, const int h, const int W, const int C, const int G, c10::BFloat16 eps, c10::BFloat16 *Y_data, c10::BFloat16 *mean_data, c10::BFloat16 *rstd_data);
+template void run_gn_fwd_kernels<float>(const float *X_data, const float *weight_data, const float *bias_data, const int N, const int h, const int W, const int C, const int G, float eps, float *Y_data, float *mean_data, float *rstd_data);
+template void run_gn_fwd_kernels<double>(const double *X_data, const double *weight_data, const double *bias_data, const int N, const int h, const int W, const int C, const int G, double eps, double *Y_data, double *mean_data, double *rstd_data);
+template void run_gn_fwd_kernels<c10::Half>(const c10::Half *X_data, const c10::Half *weight_data, const c10::Half *bias_data, const int N, const int h, const int W, const int C, const int G, c10::Half eps, c10::Half *Y_data, c10::Half *mean_data, c10::Half *rstd_data);
+template void run_gn_fwd_kernels<c10::BFloat16>(const c10::BFloat16 *X_data, const c10::BFloat16 *weight_data, const c10::BFloat16 *bias_data, const int N, const int h, const int W, const int C, const int G, c10::BFloat16 eps, c10::BFloat16 *Y_data, c10::BFloat16 *mean_data, c10::BFloat16 *rstd_data);
