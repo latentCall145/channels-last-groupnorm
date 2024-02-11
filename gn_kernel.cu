@@ -1,4 +1,3 @@
-//#include <ATen/OpMathType.h> // opmath_t
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/core/ScalarType.h>
 #include <c10/util/BFloat16.h>
@@ -31,6 +30,34 @@ typedef struct block_params {
   int d; // dimensionality (number of data rows per threadblock)
   int f; // factor (number of different threadblocks needed to represent one row of data) 
 } block_params_t;
+
+inline block_params_t calc_block_params(const int ideal_num_threads, const int threads_per_row, int f_divides = -1, const int tpb_divides = -1) {
+  /*
+  @param ideal_num_threads: absolute upper limit of threads that a block should have (e.g. a kernel that operates on only 30 elements should have a max TPB of 30 (ideal_num_threads=30))
+  @param threads_per_row: determines the user-specified upper limit on the size of blockDim.x
+    - meant to be set to the size of the last dimension, e.g. a kernel operating on tensor sized (N, R, C) would have threads_per_row=C
+  @param f_divides: optional parameter if user needs to explicitly specify a stricter requirement on the divisibility of the number of threads per block
+    - e.g. fwd with C = 2560, G = 32, TPB = 480 wouldn't work since that means 32 groups are split over f=5 blocks (5.333 groups per block)
+    - e.g. fwd with C = 2560, G = 32, TPB = 320 would work since that means 32 groups are split over f=8 blocks (4 groups per block), you could say that f divides 32 (f_divides=32)
+  @param tpb_divides: optional parameter if user needs to explicitly specify that the returned threads per block needs to divide another value (e.g. a kernel where bounds checking isn't implemented)
+    - e.g. fwd with H, W, C = 5, 5, 32; TPB = 512 wouldn't work since that means you use 1.5625 blocks to represent H*W*C (800) elements
+    - e.g. fwd with H, W, C = 5, 5, 32; TPB = 160 would work since that means you use 5 blocks to represent H*W*C (800) elements, you could say that TPB (160) divides 800 (tpb_divides=800)
+  */
+  int TPB, d = 1, f = 1;
+  f_divides = f_divides == -1 ? threads_per_row : f_divides;
+  TPB = MIN(MAX_THREADS_PER_BLOCK, ideal_num_threads);
+  if (threads_per_row < TPB) {
+    d = TPB / threads_per_row;
+    if (tpb_divides != -1) // could be put as another condition in the while loop but it hurts readability
+      while (tpb_divides % (threads_per_row * d) != 0) // d = 1 guaranteed to break this condition
+        --d;
+  }
+  else
+    while (f_divides % f != 0 || threads_per_row / f > MAX_THREADS_PER_BLOCK)
+      ++f;
+  TPB = threads_per_row * d / f;
+  return {TPB, d, f};
+}
 
 template <typename T> __device__ T inline identity(T x) {
   return x;
@@ -86,28 +113,6 @@ compute_scale_biases(
   const acc_type<T> a_nc = rstds[ng] * weight[c];
   a[nc] = a_nc;
   b[nc] = -means[ng] * a_nc + bias[c];
-}
-
-inline block_params_t calc_block_params(int ideal_num_threads, int threads_per_row, int d_preferred_divisibility = 1, int f_divides = -1) {
-  /*
-  d_preferred_divisibility: if possible, make d a multiple of d_preferred divisibilty (useful for kernels which require inputs to be divisible by the number of threads per block e.g. elementwise kernel)
-  f_divides: parameter if user needs to explicitly specify a stricter requirement on the divisibility of the number of threads per block
-    - e.g. fwd with C = 2560, G = 32, TPB = 480 wouldn't work since that means 32 groups are split over f=5 blocks (5.333 groups per block)
-    - e.g. fwd with C = 2560, G = 32, TPB = 320 would work since that means 32 groups are split over f=8 blocks (4 groups per block), you could say that f divides 32 (f_divides=32)
-  */
-  int TPB, d = 1, f = 1;
-  f_divides = f_divides == -1 ? threads_per_row : f_divides;
-  TPB = MIN(MAX_THREADS_PER_BLOCK, ideal_num_threads);
-  if (threads_per_row < TPB) {
-    d = TPB / threads_per_row;
-    if (d / d_preferred_divisibility != 0)
-      d = d_preferred_divisibility * (d / d_preferred_divisibility);
-  }
-  else
-    while (f_divides % f != 0 || threads_per_row / f > MAX_THREADS_PER_BLOCK)
-      ++f;
-  TPB = threads_per_row * d / f;
-  return {TPB, d, f};
 }
 
 template <typename T, int LOOP_I, int vec_elems>
@@ -394,7 +399,7 @@ void run_gn_fwd_kernels(
   
   // compute means/rstds over width dimension
   {
-    auto [TPB, d, f] = calc_block_params(W * C, C, 1, G);
+    auto [TPB, d, f] = calc_block_params(W * C, C, G);
     DEBUG("starting compute_stats 1, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", N, H, W, C, G, (C / G), TPB, d, f, (G / f));
     compute_stats_pt1<<<dim3(N, H, f), dim3(TPB / d, d), 0, cuda_stream>>>(
         X_data,
@@ -423,9 +428,9 @@ void run_gn_fwd_kernels(
     else vec_elems = 1;
     auto [TPB, d, f] = calc_block_params(H * W * C / 8 / vec_elems, C);
     if (!ELEM_DEBUG && ((H * W * C) % (TPB * 8 * f * vec_elems) == 0)) {
-      DEBUG("starting scale_shift, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", N, H, W, C, G, (C / G), TPB, d, f, (G / f));
       const int LOOP_I = 8;
       const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
+      DEBUG("scale shift starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, TPB, f, num_blocks, vec_elems);
       if (vec_elems == 4)
         scale_shift<T, LOOP_I, 4><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
       else if (vec_elems == 2)
@@ -434,8 +439,9 @@ void run_gn_fwd_kernels(
         scale_shift<T, LOOP_I, 1><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
     }
     else {// relatively slow fallback
-      DEBUG("SLOW FALLBACK, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, G/f: %d\n", N, H, W, C, G, (C / G), TPB, d, f, (G / f));
-      scale_shift<T, 1, 1><<<dim3(N * H * W, f), C / f, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      const int num_blocks = N * H * W;
+      DEBUG("SLOW FALLBACK, dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, C/f, f, num_blocks, vec_elems);
+      scale_shift<T, 1, 1><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
     }
   }
 
@@ -814,7 +820,7 @@ void run_gn_bwd_kernels(
 
   // sum over W dim
   {
-    auto [TPB, d, f] = calc_block_params(W * C, C, 4, G);
+    auto [TPB, d, f] = calc_block_params(W * C, C, G);
     DEBUG("starting width reduce, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
     width_reduce<<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB, cuda_stream>>>(
         dy_data, X_data, 
@@ -839,7 +845,7 @@ void run_gn_bwd_kernels(
 
   // compute weight/bias grads
   {
-    auto [TPB, d, f] = calc_block_params(C, C, 1, G);
+    auto [TPB, d, f] = calc_block_params(C, C, G);
     DEBUG("starting compute dweight dbias, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
     compute_dweight_dbias<<<f, C / f, 0, cuda_stream>>>(
         mean_data, rstd_data,
@@ -854,7 +860,7 @@ void run_gn_bwd_kernels(
   T_ACC *coef4_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C);
   // compute fused scales/biases for dx elementwise kernel
   {
-    auto [TPB, d, f] = calc_block_params(C, C, 1, G);
+    auto [TPB, d, f] = calc_block_params(C, C, G);
     DEBUG("starting bwd scale biases, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
     compute_bwd_scale_biases<<<dim3(N, f), C / f, sizeof(T_ACC) * 2 * C / f, cuda_stream>>>(
         mean_data, rstd_data, weight_data, bias_data,
@@ -868,22 +874,22 @@ void run_gn_bwd_kernels(
     if (D % 4 == 0) vec_elems = 4;
     else if (D % 2 == 0) vec_elems = 2;
     else vec_elems = 1;
-    auto [TPB, d, f] = calc_block_params(H * W * C, C, 1, G);
+    auto [TPB, d, f] = calc_block_params(H * W * C, C, G);
     if (!ELEM_DEBUG && ((H * W * C) % (TPB * 8 * f * vec_elems) == 0)) {
       const int LOOP_I = 8;
-      const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
-      DEBUG("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, num blocks (before vectors): %d\n", N, H, W, C, G, D, TPB, num_blocks);
+      const int num_blocks = ceil((float)N * H * W * C / TPB / LOOP_I / f);
+      DEBUG("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, TPB, f, num_blocks, vec_elems);
       if (D % 4 == 0)
-        dx_elem_kernel<T, LOOP_I, 4><<<dim3(num_blocks / 4, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N, C, G, dx_data);
+        dx_elem_kernel<T, LOOP_I, 4><<<dim3(num_blocks / 4, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
       else if (D % 2 == 0)
-        dx_elem_kernel<T, LOOP_I, 2><<<dim3(num_blocks / 2, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef2_data, N, C, G, dx_data);
+        dx_elem_kernel<T, LOOP_I, 2><<<dim3(num_blocks / 2, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
       else
-        dx_elem_kernel<T, LOOP_I, 1><<<dim3(num_blocks / 1, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef1_data, N, C, G, dx_data);
+        dx_elem_kernel<T, LOOP_I, 1><<<dim3(num_blocks / 1, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
     }
     else { // relatively slow fallback
-      const int num_blocks = N * H * W * C / TPB / f;
-      DEBUG("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, num blocks (before vectors): %d\n", N, H, W, C, G, D, TPB, num_blocks);
-      dx_elem_kernel<T, 1, 1><<<dim3(num_blocks, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N, C, G, dx_data);
+      const int num_blocks = N * H * W;
+      DEBUG("SLOW FALLBACK, dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, C/f, f, num_blocks, vec_elems);
+      dx_elem_kernel<T, 1, 1><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
     }
   }
 

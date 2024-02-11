@@ -96,6 +96,71 @@ class GN_NCHW(nn.GroupNorm):
             b = torch.zeros((self.num_channels,), device=x.device, dtype=x.dtype)
             return GN_NCHW_Func.apply(x.contiguous(), w, b, self.num_groups, self.eps)
 
+def red(text):
+    return '\033[91m' + str(text) + '\033[0m'
+def green(text):
+    return '\033[92m' + str(text) + '\033[0m'
+def yellow(text):
+    return '\033[93m' + str(text) + '\033[0m'
+def blue(text):
+    return '\033[94m' + str(text) + '\033[0m'
+
+def config_filter(x): # returns true if config is valid
+    B, C, R, G = x
+    if C % G != 0:
+        return False
+
+    if R == 1: # this causes an autograd problem where it gets confused since the tensor is both contiguous in channels first/last format 
+        return False
+
+    if C / G > 512: # this isn't supported since it is assumed that at least one full group is processed per block in the fwd and the max threads per block is set to 512
+        return False
+
+    '''
+    return (B, C, R, G) in {
+            (1,  512, 8, 32),
+            #(2,  512, 8, 32),
+            #(4,  512, 8, 32),
+            #(8,  512, 8, 32),
+            (16, 512, 8, 32),
+            #(32, 512, 8, 32),
+
+            (1,  512, 16, 32),
+            #(2,  512, 16, 32),
+            #(4,  512, 16, 32),
+            #(8,  512, 16, 32),
+            (16, 512, 16, 32),
+            #(32, 512, 16, 32),
+
+            (1, 64, 256, 16),
+            #(2, 64, 256, 16),
+            #(4, 64, 256, 16),
+            #(8, 64, 256, 16),
+            (16, 64, 256, 16),
+            #(32, 64, 256, 16),
+
+            (1, 64, 512, 16),
+            #(2, 64, 512, 16),
+            #(4, 64, 512, 16),
+            #(8, 64, 512, 16),
+            (4, 64, 512, 16),
+            #(32, 64, 512, 16),
+
+            #(1, 128, 64, 16),
+            #(2, 128, 64, 16),
+            #(4, 128, 32, 16),
+            #(8, 128, 32, 16),
+            #(16, 128, 32, 16),
+            #(32, 128, 32, 16),
+            }
+    '''
+
+    dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
+    estimated_mem_usage_gib = (3 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
+    if estimated_mem_usage_gib > 4: # vram filter
+        return False
+    return True
+
 if __name__ == '__main__':
     DTYPE = torch.double
     DTYPE = torch.bfloat16
@@ -106,81 +171,87 @@ if __name__ == '__main__':
 
     if MODE != 'bench':
         #DTYPEs = (torch.bfloat16, torch.float, torch.double)
-        #Bs = (2, 2, 4, 8, 16)
-        #Rs = (8, 16, 64, 256, 512)
-        #Cs = (32, 64, 128, 256, 512)
-        #itertools.product(DTYPEs, Bs, Rs, Cs)
+        Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
+        Cs = (
+                32, 64, 128, 256, 512,
+                13, 140, 125, 961,
+                160, 320, 640, 960, 1280, 1600, 1920, 2240, 2560
+                )
+        Rs = (
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 17,
+                8, 16, 64, 128, 256, 512,
+                )
+        Gs = (1, 2, 4, 8, 16, 32,)
+        all_params = itertools.product(Bs, Cs, Rs, Gs)
 
-        for B, R, C, G in (
-            (1, 2, 4, 2),
-            (1, 2, 32, 32),
-            (1, 2, 64, 32),
-            (1, 2, 128, 32),
-            (1, 4, 32, 32),
-            (1, 4, 64, 32),
-            (1, 4, 128, 32),
-            (1, 8, 32, 32),
-            (1, 8, 64, 32),
-            (1, 8, 128, 32),
-            (1, 16, 32, 32),
-            (1, 16, 64, 32),
-            (1, 16, 128, 32),
-            (1, 32, 32, 32),
-            (1, 32, 64, 32),
-            (1, 32, 128, 32),
-            (1, 64, 32, 32),
-            (1, 64, 64, 32),
-            (1, 64, 128, 32),
+        err_inputs = []
+        for params in sorted(
+                filter(config_filter, all_params),
 
-            (1, 1024, 64, 32),
-            (1, 640, 64, 32),
-            (1, 257, 64, 32),
-            (1, 256, 64, 32),
-            (1, 512, 64, 32),
-            (1, 512, 96, 32),
-            (1, 64, 960, 32),
-            (1, 64, 640, 32),
-            (1, 64, 256, 32),
-            (1, 32, 1920, 32),
-            (2, 32, 1280, 32),
-            (1, 64, 320, 32),
-            (1, 32, 960, 32),
-            (1, 16, 2560, 32),
-            (1, 16, 2560, 32),
-            (1, 32, 640, 32),
-            (1, 16, 1920, 32),
-            (1, 16, 1280, 32),
-            (1, 32, 320, 32),
-            (1, 8, 2560, 32),
-            (1, 16, 640, 32),
-            (1, 8, 1280, 32),
+            #    [
+            #(1, 64, 960, 32),
+            #(1, 64, 640, 32),
+            #(1, 64, 256, 32),
+            #(1, 32, 1920, 32),
+            #(2, 32, 1280, 32),
+            #(1, 64, 320, 32),
+            #(1, 32, 960, 32),
+            #(1, 16, 2560, 32),
+            #(1, 16, 2560, 32),
+            #(1, 32, 640, 32),
+            #(1, 16, 1920, 32),
+            #(1, 16, 1280, 32),
+            #(1, 32, 320, 32),
+            #(1, 8, 2560, 32),
+            #(1, 16, 640, 32),
+            #(1, 8, 1280, 32),
 
-            (1, 512, 64, 32),
-            (1, 128, 256, 32),
-            (1, 64, 512, 32),
-            (4, 512, 64, 32),
-            (4, 128, 256, 32),
-            (4, 64, 512, 32),
-            (1, 64, 256, 32),
-            (2, 64, 128, 32),
-            (2, 32, 128, 32),
-            (2, 8, 512, 32),
-            (2, 4, 512, 32),
-            (1, 4, 512, 32),
-            (2, 4, 256, 32),
-            (1, 4, 256, 32),
-            (8, 64, 1024, 32),
-            (13, 65, 961, 31),
-            (3, 5, 31, 31),
-            (3, 5, 32, 32),
-            (4, 4, 32, 32),
-            (2, 65, 128, 32),
-            (1, 3, 6, 2),
+            #(1, 64, 64, 32),
+            #(1, 64, 64, 64),
+            #(1, 64, 128, 128),
+            #(1, 64, 256, 128),
+            #(1, 64, 256, 256),
+
+            #(1, 64, 128, 32),
+            #(1, 64, 128, 8),
+            #(1, 64, 32, 8),
+            #(1, 64, 16, 8),
+            #(1, 64, 256, 32),
+            #(1, 64, 512, 32),
+            #(1, 64, 256, 256),
+
+            #(1, 512, 64, 32),
+            #(1, 128, 256, 32),
+            #(1, 64, 512, 32),
+            #(4, 512, 64, 32),
+            #(4, 128, 256, 32),
+            #(4, 64, 512, 32),
+            #(1, 64, 256, 32),
+            #(2, 64, 128, 32),
+            #(2, 32, 128, 32),
+            #(2, 8, 512, 32),
+            #(2, 4, 512, 32),
+            #(1, 4, 512, 32),
+            #(2, 4, 256, 32),
+            #(1, 4, 256, 32),
+            #(8, 64, 1024, 32),
+            #(13, 65, 961, 31),
+            #(3, 5, 31, 31),
+            #(3, 5, 32, 32),
+            #(4, 4, 32, 32),
+            #(1, 51, 128, 32),
+            #(1, 12, 128, 32),
+            #(2, 65, 128, 32),
+            #(1, 3, 6, 2),
+            #],
+            key = lambda x: x[0]*x[1]*x[2]*x[3]
         ):
+            B, C, R, G = params
             dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
-            estimated_mem_usage_gib = 2 * (4.5 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
+            estimated_mem_usage_gib = 2 * (7.5 * dtype_size * B * C * R * R) / 2**30 # this is just a rough estimate, likely wrong
             if estimated_mem_usage_gib > 4: # vram filter
                 continue
+
             torch.cuda.empty_cache()
             print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
             x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 1000
@@ -200,8 +271,8 @@ if __name__ == '__main__':
                 gn1 = nn.GroupNorm(G, C).double().cuda()
                 gn3 = nn.GroupNorm(G, C).cuda().to(DTYPE)
                 with torch.no_grad():
-                    w = torch.randn((C,), dtype=DTYPE) #* 1000
-                    b = torch.randn((C,), dtype=DTYPE) #* 1000
+                    w = torch.randn((C,), dtype=DTYPE) * 1000
+                    b = torch.randn((C,), dtype=DTYPE) * 1000
                     gn1.weight.copy_(w.detach().double())
                     gn1.bias.copy_(b.detach().double())
                     gn2.weight.copy_(w.detach())
@@ -209,9 +280,9 @@ if __name__ == '__main__':
                     gn3.weight.copy_(w.detach())
                     gn3.bias.copy_(b.detach())
 
+                act_fn = lambda x: F.leaky_relu(x, 0.1)
                 act_fn = lambda x: x
                 act_fn = F.relu
-                act_fn = lambda x: F.leaky_relu(x, 0.1)
                 act_fn = F.silu
                 g1 = act_fn(gn1(x.double()))
                 g2 = gn2(x)
@@ -220,38 +291,52 @@ if __name__ == '__main__':
                 g1sum = (g1 * rand_dy).sum()
                 g2sum = (g2 * rand_dy).sum()
                 g3sum = (g3 * rand_dy).sum()
-
                 def print_err(act_double, act_testing, act_ref, left_pad=0):
-                    lpad = ' ' * left_pad
-                    testing_err = (act_double - act_testing).abs().mean()
-                    ref_err = (act_double - act_ref).abs().mean()
-                    if testing_err / ref_err > 2 and testing_err > 1e-6:
-                        print(f'{lpad}{act_double - act_testing}')
-                        print(f'{lpad}Your error: {testing_err}, expected error: {ref_err}')
-                    else:
-                        print(f'{lpad}Negligible difference (testing err: {testing_err:.2e}, ref err: {ref_err:.2e}) found')
+                    with torch.no_grad():
+                        lpad = ' ' * left_pad
+                        red_error = red('ERROR: ')
+                        act_double_norm = torch.linalg.norm(act_double).float()
+                        norm_double, norm_test, norm_ref = map(lambda x: torch.flatten(x.float()) / act_double_norm, (act_double, act_testing, act_ref))
+                        testing_err = norm_double @ norm_test - 1
+                        expected_err = norm_double @ norm_ref - 1
+                        if testing_err.isnan() or testing_err / expected_err > 2 and testing_err > 1e-6:
+                            print(red(f'{lpad}Your error: {testing_err}, expected error: {expected_err}'))
+                            err_inputs.append((params, testing_err, expected_err))
+                        #else:
+                            #print(f'{lpad}Negligible difference (testing err: {testing_err:.2e}, ref err: {expected_err:.2e}) found')
 
                 print('  FORWARD')
                 print_err(g1, g2, g3, 4)
-
                 print('  BACKWARD')
                 print('    wrt weight')
-                g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
-                g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
-                g3_grad_wrt_w = torch.autograd.grad(g3sum, gn3.weight, retain_graph=True)[0]
+                g1_grad_wrt_w = torch.autograd.grad(
+                        g1sum, gn1.weight, retain_graph=True)[0]
+                g2_grad_wrt_w = torch.autograd.grad(
+                        g2sum, gn2.weight, retain_graph=True)[0]
+                g3_grad_wrt_w = torch.autograd.grad(
+                        g3sum, gn3.weight, retain_graph=True)[0]
                 print_err(g1_grad_wrt_w, g2_grad_wrt_w, g3_grad_wrt_w, 6)
 
-                #print('    wrt bias')
-                #g1_grad_wrt_b = torch.autograd.grad(g1sum, gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),))
-                #g2_grad_wrt_b = torch.autograd.grad(g2sum, gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),))
-                #g3_grad_wrt_b = torch.autograd.grad(g3sum, gn3.bias, retain_graph=True)[0].reshape((gn3.bias.numel(),))
-                #print_err(g1_grad_wrt_b, g2_grad_wrt_b, g3_grad_wrt_b, 6)
 
-                #print('    wrt X')
-                #g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-                #g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-                #g3_grad_wrt_x = torch.autograd.grad(g3sum, x, retain_graph=True)[0] #.reshape((x.numel(),))
-                #print_err(g1_grad_wrt_x, g2_grad_wrt_x, g3_grad_wrt_x, 6)
+                print('    wrt bias')
+                g1_grad_wrt_b = torch.autograd.grad(
+                        g1sum, gn1.bias, retain_graph=True)[0]
+                g2_grad_wrt_b = torch.autograd.grad(
+                        g2sum, gn2.bias, retain_graph=True)[0]
+                g3_grad_wrt_b = torch.autograd.grad(
+                        g3sum, gn3.bias, retain_graph=True)[0]
+                print_err(g1_grad_wrt_b, g2_grad_wrt_b, g3_grad_wrt_b, 6)
+
+                print('    wrt X')
+                g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0]
+                g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0]
+                g3_grad_wrt_x = torch.autograd.grad(g3sum, x, retain_graph=True)[0]
+                print_err(g1_grad_wrt_x, g2_grad_wrt_x, g3_grad_wrt_x, 6)
+        if len(err_inputs) > 0:
+            print(red('Error inputs found:'))
+            print('\n'.join(map(lambda x: f'{x[0]}, testing error: {x[1]:.2e}, expected error: {x[2]:.2e}', err_inputs)))
+        else:
+            print(green('No errors found :)'))
 
     if MODE != 'check':
         NSEC = 1 # number of seconds that each kernel runs for on a certain input
@@ -278,68 +363,9 @@ if __name__ == '__main__':
         print(f'Writing to {fname}')
         outfile = open(fname, 'w')
         outfile.write('Kernel,B (batch),C (num channels),R (resolution),G (num groups), D (C/G),Speed (it/s; 25th percentile),Speed (it/s; 50th percentile),Speed (it/s; 75th percentile)\n')
-
-        def config_filter(x): # returns true if config is valid
-            B, C, R, G = x
-            if G > C:
-                return False
-
-            '''
-            return (B, C, R, G) in {
-                    (1,  512, 8, 32),
-                    #(2,  512, 8, 32),
-                    #(4,  512, 8, 32),
-                    #(8,  512, 8, 32),
-                    (16, 512, 8, 32),
-                    #(32, 512, 8, 32),
-
-                    (1,  512, 16, 32),
-                    #(2,  512, 16, 32),
-                    #(4,  512, 16, 32),
-                    #(8,  512, 16, 32),
-                    (16, 512, 16, 32),
-                    #(32, 512, 16, 32),
-
-                    (1, 64, 256, 16),
-                    #(2, 64, 256, 16),
-                    #(4, 64, 256, 16),
-                    #(8, 64, 256, 16),
-                    (16, 64, 256, 16),
-                    #(32, 64, 256, 16),
-
-                    (1, 64, 512, 16),
-                    #(2, 64, 512, 16),
-                    #(4, 64, 512, 16),
-                    #(8, 64, 512, 16),
-                    (4, 64, 512, 16),
-                    #(32, 64, 512, 16),
-
-                    #(1, 128, 64, 16),
-                    #(2, 128, 64, 16),
-                    #(4, 128, 32, 16),
-                    #(8, 128, 32, 16),
-                    #(16, 128, 32, 16),
-                    #(32, 128, 32, 16),
-                    }
-            '''
-
-            dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
-            estimated_mem_usage_gib = (3 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
-            if estimated_mem_usage_gib > 4: # vram filter
-                return False
-            return True
         
         configs = list(filter(config_filter, itertools.product(BATCHES, CHANNELS, RESOLUTIONS, NUM_GROUPS)))
         print('Estimated time (seconds) to complete:', NSEC * len(configs) * len(GN_KERNELS))
-
-        def red(text):
-            return '\033[91m' + str(text) + '\033[0m'
-        def green(text):
-            return '\033[92m' + str(text) + '\033[0m'
-        def yellow(text):
-            return '\033[93m' + str(text) + '\033[0m'
-        def blue(text):
-            return '\033[94m' + str(text) + '\033[0m'
 
         for B, C, R, G in configs:
             x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
