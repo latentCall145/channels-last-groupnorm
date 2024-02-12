@@ -106,7 +106,7 @@ def blue(text):
     return '\033[94m' + str(text) + '\033[0m'
 
 def config_filter(x): # returns true if config is valid
-    B, C, R, G = x
+    DTYPE, B, C, R, G = x
     if C % G != 0:
         return False
 
@@ -156,7 +156,7 @@ def config_filter(x): # returns true if config is valid
     '''
 
     dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
-    estimated_mem_usage_gib = (3 * dtype_size * B * C * R * R) / 2**30 # main VRAM tensors: X_nchw (shape=(B,C,R,R)), X_nhwc (same shape), Y (same shape)
+    estimated_mem_usage_gib = (25 * dtype_size * B * C * R * R) / 2**30 #  this is just a rough estimate, likely wrong
     if estimated_mem_usage_gib > 4: # vram filter
         return False
     return True
@@ -171,6 +171,7 @@ if __name__ == '__main__':
 
     if MODE != 'bench':
         #DTYPEs = (torch.bfloat16, torch.float, torch.double)
+        DTYPEs = (torch.float,)
         Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
         Cs = (
                 32, 64, 128, 256, 512,
@@ -182,7 +183,7 @@ if __name__ == '__main__':
                 8, 16, 64, 128, 256, 512,
                 )
         Gs = (1, 2, 4, 8, 16, 32,)
-        all_params = itertools.product(Bs, Cs, Rs, Gs)
+        all_params = itertools.product(DTYPEs, Bs, Cs, Rs, Gs)
 
         err_inputs = []
         for params in sorted(
@@ -244,14 +245,9 @@ if __name__ == '__main__':
             #(2, 65, 128, 32),
             #(1, 3, 6, 2),
             #],
-            key = lambda x: x[0]*x[1]*x[2]*x[3]
+            key = lambda x: x[1]*x[2]*x[3]*x[4]
         ):
-            B, C, R, G = params
-            dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
-            estimated_mem_usage_gib = 2 * (7.5 * dtype_size * B * C * R * R) / 2**30 # this is just a rough estimate, likely wrong
-            if estimated_mem_usage_gib > 4: # vram filter
-                continue
-
+            DTYPE, B, C, R, G = params
             torch.cuda.empty_cache()
             print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
             x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 1000
@@ -268,13 +264,13 @@ if __name__ == '__main__':
                 g2sum = g2.sum()
                 g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
             else:
-                gn1 = nn.GroupNorm(G, C).double().cuda()
+                gn1 = nn.GroupNorm(G, C).float().cuda()
                 gn3 = nn.GroupNorm(G, C).cuda().to(DTYPE)
                 with torch.no_grad():
                     w = torch.randn((C,), dtype=DTYPE) * 1000
                     b = torch.randn((C,), dtype=DTYPE) * 1000
-                    gn1.weight.copy_(w.detach().double())
-                    gn1.bias.copy_(b.detach().double())
+                    gn1.weight.copy_(w.detach().float())
+                    gn1.bias.copy_(b.detach().float())
                     gn2.weight.copy_(w.detach())
                     gn2.bias.copy_(b.detach())
                     gn3.weight.copy_(w.detach())
@@ -284,21 +280,21 @@ if __name__ == '__main__':
                 act_fn = lambda x: x
                 act_fn = F.relu
                 act_fn = F.silu
-                g1 = act_fn(gn1(x.double()))
+                g1 = act_fn(gn1(x.float()))
                 g2 = gn2(x)
                 g3 = act_fn(gn3(x))
                 rand_dy = torch.rand_like(g3)
                 g1sum = (g1 * rand_dy).sum()
                 g2sum = (g2 * rand_dy).sum()
                 g3sum = (g3 * rand_dy).sum()
-                def print_err(act_double, act_testing, act_ref, left_pad=0):
+                def print_err(act_float, act_testing, act_ref, left_pad=0):
                     with torch.no_grad():
                         lpad = ' ' * left_pad
                         red_error = red('ERROR: ')
-                        act_double_norm = torch.linalg.norm(act_double).float()
-                        norm_double, norm_test, norm_ref = map(lambda x: torch.flatten(x.float()) / act_double_norm, (act_double, act_testing, act_ref))
-                        testing_err = norm_double @ norm_test - 1
-                        expected_err = norm_double @ norm_ref - 1
+                        act_float_norm = torch.linalg.norm(act_float).float()
+                        norm_float, norm_test, norm_ref = map(lambda x: torch.flatten(x.float()) / act_float_norm, (act_float, act_testing, act_ref))
+                        testing_err = norm_float @ norm_test - 1
+                        expected_err = norm_float @ norm_ref - 1
                         if testing_err.isnan() or testing_err / expected_err > 2 and testing_err > 1e-6:
                             print(red(f'{lpad}Your error: {testing_err}, expected error: {expected_err}'))
                             err_inputs.append((params, testing_err, expected_err))
