@@ -8,8 +8,9 @@ Furthermore, by fusing the activation with the GN kernel, further speedups and m
 
 ## Use
 Just a drop-in replacement for torch.nn.GroupNorm (except the activation keyword, which allows the GN forward/backward to run using a fused activation)
+
 Code:
-```
+```python
 '''
 if your directory structure is like:
 gnNHWC
