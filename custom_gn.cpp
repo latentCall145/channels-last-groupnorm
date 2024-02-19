@@ -12,7 +12,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_fwd(
     const at::Tensor weight,
     const at::Tensor bias,
     const int64_t G,
-    double eps) {
+    double eps,
+    const int64_t act_fn_option) {
   CHECK_CUDA(X);
   CHECK_CUDA(weight);
   CHECK_CUDA(bias);
@@ -34,7 +35,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_fwd(
     run_gn_fwd_kernels<scalar_t>(
         X_nhwc.const_data_ptr<scalar_t>(),
         weight.const_data_ptr<scalar_t>(), bias.const_data_ptr<scalar_t>(),
-        N, H, W, C, G, static_cast<scalar_t>(eps),
+        N, H, W, C, G, static_cast<scalar_t>(eps), act_fn_option,
         X_out.mutable_data_ptr<scalar_t>(), means.mutable_data_ptr<scalar_t>(), rstds.mutable_data_ptr<scalar_t>()
     );
   });
@@ -48,7 +49,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_bwd(
     const at::Tensor bias,
     const at::Tensor means,
     const at::Tensor rstds,
-    const int64_t G) {
+    const int64_t G,
+    const int64_t act_fn_option) {
   CHECK_CUDA(dy);
   CHECK_CUDA(X);
   CHECK_CUDA(weight);
@@ -75,7 +77,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_bwd(
       dy_nhwc.const_data_ptr<scalar_t>(), X_nhwc.const_data_ptr<scalar_t>(),
       weight.const_data_ptr<scalar_t>(), bias.const_data_ptr<scalar_t>(),
       means.const_data_ptr<scalar_t>(), rstds.const_data_ptr<scalar_t>(),
-      N, H, W, C, G,
+      N, H, W, C, G, act_fn_option,
       dX.mutable_data_ptr<scalar_t>(), dweight.mutable_data_ptr<scalar_t>(), dbias.mutable_data_ptr<scalar_t>()
       );
   });
