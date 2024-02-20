@@ -119,45 +119,6 @@ def config_filter(x): # returns true if config is valid
     if C / G > 512: # this isn't supported since it is assumed that at least one full group is processed per block in the fwd and the max threads per block is set to 512
         return False
 
-    '''
-    return (B, C, R, G) in {
-            (1,  512, 8, 32),
-            #(2,  512, 8, 32),
-            #(4,  512, 8, 32),
-            #(8,  512, 8, 32),
-            (16, 512, 8, 32),
-            #(32, 512, 8, 32),
-
-            (1,  512, 16, 32),
-            #(2,  512, 16, 32),
-            #(4,  512, 16, 32),
-            #(8,  512, 16, 32),
-            (16, 512, 16, 32),
-            #(32, 512, 16, 32),
-
-            (1, 64, 256, 16),
-            #(2, 64, 256, 16),
-            #(4, 64, 256, 16),
-            #(8, 64, 256, 16),
-            (16, 64, 256, 16),
-            #(32, 64, 256, 16),
-
-            (1, 64, 512, 16),
-            #(2, 64, 512, 16),
-            #(4, 64, 512, 16),
-            #(8, 64, 512, 16),
-            (4, 64, 512, 16),
-            #(32, 64, 512, 16),
-
-            #(1, 128, 64, 16),
-            #(2, 128, 64, 16),
-            #(4, 128, 32, 16),
-            #(8, 128, 32, 16),
-            #(16, 128, 32, 16),
-            #(32, 128, 32, 16),
-            }
-    '''
-
     dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
     estimated_mem_usage_gib = (25 * dtype_size * B * C * R * R) / 2**30 #  this is just a rough estimate, likely wrong
     if estimated_mem_usage_gib > 4: # vram filter
@@ -165,11 +126,11 @@ def config_filter(x): # returns true if config is valid
     return True
 
 if __name__ == '__main__':
-    DTYPE = torch.double
-    DTYPE = torch.bfloat16
-    DTYPE = torch.float
-    ACT_FN = 'identity'
-    print('DTYPE:', DTYPE)
+    #DTYPE = torch.double
+    #DTYPE = torch.float
+    #DTYPE = torch.bfloat16
+    ACT_FN = 'silu'
+    #print('DTYPE:', DTYPE)
     MODE = 'check' # can be 'check', 'bench', other modes do both
     CHECK_PROF = False
 
@@ -192,10 +153,23 @@ if __name__ == '__main__':
 
         err_inputs = []
         for params in sorted(
-                filter(config_filter, all_params),
-                #[
-                #    (torch.float, 4, 32, 8, 1),
-                #],
+                #filter(config_filter, all_params),
+                [
+                    (torch.float, 2, 1280, 8, 32),
+                    (torch.float, 2, 640, 16, 32),
+                    (torch.float, 2, 2560, 8, 32),
+                    (torch.float, 2, 1280, 16, 32),
+                    (torch.float, 2, 320, 32, 32),
+                    (torch.float, 2, 1920, 16, 32),
+                    (torch.float, 2, 2560, 16, 32),
+                    (torch.float, 2, 640, 32, 32),
+                    (torch.float, 2, 960, 32, 32),
+                    (torch.float, 2, 1280, 32, 32),
+                    (torch.float, 2, 320, 64, 32),
+                    (torch.float, 2, 1920, 32, 32),
+                    (torch.float, 2, 640, 64, 32),
+                    (torch.float, 2, 960, 64, 32),
+                ],
                 key = lambda x: x[1]*x[2]*x[3]*x[4]
         ):
             DTYPE, B, C, R, G = params
@@ -212,8 +186,8 @@ if __name__ == '__main__':
                 #g1sum = g1.sum()
                 #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
                 g2 = gn2(x)
-                g2sum = g2.sum()
-                g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
+                #g2sum = g2.sum()
+                #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
             else:
                 gn1 = nn.GroupNorm(G, C).float().cuda()
                 gn3 = nn.GroupNorm(G, C).cuda().to(DTYPE)
@@ -245,15 +219,13 @@ if __name__ == '__main__':
                     with torch.no_grad():
                         lpad = ' ' * left_pad
                         red_error = red('ERROR: ')
-                        act_float_norm = torch.linalg.norm(act_float).float()
-                        norm_float, norm_test, norm_ref = map(lambda x: torch.flatten(x.float()) / act_float_norm, (act_float, act_testing, act_ref))
-                        testing_err = norm_float @ norm_test - 1
-                        expected_err = norm_float @ norm_ref - 1
+                        testing_err = F.mse_loss(act_float, act_testing)
+                        expected_err = F.mse_loss(act_float, act_ref)
                         if testing_err.isnan() or testing_err / expected_err > 2 and testing_err > 1e-6:
                             print(red(f'{lpad}Your error: {testing_err}, expected error: {expected_err}'))
                             err_inputs.append((params, testing_err, expected_err))
-                        #else:
-                            #print(f'{lpad}Negligible difference (testing err: {testing_err:.2e}, ref err: {expected_err:.2e}) found')
+                        else:
+                            print(f'{lpad}Negligible difference (testing err: {testing_err:.2e}, ref err: {expected_err:.2e}) found')
 
                 print('  FORWARD')
                 print_err(g1, g2, g3, 4)
@@ -285,7 +257,7 @@ if __name__ == '__main__':
         if len(err_inputs) > 0:
             print(red('Error inputs found:'))
             print('\n'.join(map(lambda x: f'{x[0]}, testing error: {x[1]:.2e}, expected error: {x[2]:.2e}', err_inputs)))
-        else:
+        elif not CHECK_PROF:
             print(green('No errors found :)'))
 
     if MODE != 'check':

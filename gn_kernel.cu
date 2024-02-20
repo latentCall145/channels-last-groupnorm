@@ -246,7 +246,7 @@ compute_stats_pt2(
   }
 }
 
-template <typename T, int LOOP_I, int vec_elems>
+template <typename T, int LOOP_I, int vec_elems, int64_t act_fn_option>
 __global__ void
 scale_shift(
     const T* X_data,
@@ -257,7 +257,7 @@ scale_shift(
     const int N,
     const int C,
     const int G,
-    const int64_t act_fn_option,
+    //const int64_t act_fn_option,
     T* y
     ) {
   /*
@@ -270,7 +270,6 @@ scale_shift(
   X shape: (N, H, W, C) -view-> (NHWC / (TPB * LOOP_I * f), LOOP_I, f, TPB); X.stride: (LOOP_I * f * TPB, f * TPB, TPB, 1)
   */
   using T_ACC = typename acc_type<T>::type;
-  using V_ACC = float_vec<T_ACC, vec_elems>;
   using V = float_vec<T, vec_elems>;
   const int f = gridDim.y;
   const int TPB = blockDim.x;
@@ -319,13 +318,13 @@ scale_shift(
     };
   }
 
-
   T (*act_fn)(T);
-  switch (act_fn_option) {
-    case 0: act_fn = identity; break;
-    case 1: act_fn = relu; break;
-    case 2: act_fn = silu; break;
-  }
+  if constexpr (act_fn_option == 0)
+    act_fn = identity;
+  else if constexpr (act_fn_option == 1)
+    act_fn = relu;
+  else if constexpr (act_fn_option == 2)
+    act_fn = silu;
 
 #pragma unroll
   for (int i = 0; i < LOOP_I; ++i) {
@@ -334,22 +333,22 @@ scale_shift(
     idx += i * f * TPB;
     idx += blockIdx.y * TPB;
     idx += threadIdx.x;
-    V_ACC X_vec = static_cast<V_ACC>(X_vecs[idx]);
-
+    V X_vec = X_vecs[idx];
+    
     if constexpr (vec_elems == 1)
-      y_vecs[idx] = {act_fn(X_vec.x * fused_weight.x + fused_bias.x)};
+      y_vecs[idx] = {act_fn(static_cast<T_ACC>(X_vec.x) * fused_weight.x + fused_bias.x)};
     else if constexpr (vec_elems == 2) {
       y_vecs[idx] = {
-        act_fn(X_vec.x * fused_weight.x + fused_bias.x),
-        act_fn(X_vec.y * fused_weight.y + fused_bias.y),
+        act_fn(static_cast<T_ACC>(X_vec.x) * fused_weight.x + fused_bias.x),
+        act_fn(static_cast<T_ACC>(X_vec.y) * fused_weight.y + fused_bias.y),
       };
     }
     else if constexpr (vec_elems == 4) {
       y_vecs[idx] = {
-        act_fn(X_vec.x * fused_weight.x + fused_bias.x),
-        act_fn(X_vec.y * fused_weight.y + fused_bias.y),
-        act_fn(X_vec.z * fused_weight.z + fused_bias.z),
-        act_fn(X_vec.w * fused_weight.w + fused_bias.w),
+        act_fn(static_cast<T_ACC>(X_vec.x) * fused_weight.x + fused_bias.x),
+        act_fn(static_cast<T_ACC>(X_vec.y) * fused_weight.y + fused_bias.y),
+        act_fn(static_cast<T_ACC>(X_vec.z) * fused_weight.z + fused_bias.z),
+        act_fn(static_cast<T_ACC>(X_vec.w) * fused_weight.w + fused_bias.w),
       };
     }
   }
@@ -409,18 +408,35 @@ void run_gn_fwd_kernels(
     if (!ELEM_DEBUG && ((H * W * C) % (TPB * 8 * f * vec_elems) == 0)) {
       const int LOOP_I = 8;
       const int num_blocks = N * H * W * C / TPB / LOOP_I / f;
-      DEBUG("scale shift starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, TPB, f, num_blocks, vec_elems);
-      if (vec_elems == 4)
-        scale_shift<T, LOOP_I, 4><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, act_fn_option, Y_data);
-      else if (vec_elems == 2)
-        scale_shift<T, LOOP_I, 2><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, act_fn_option, Y_data);
-      else
-        scale_shift<T, LOOP_I, 1><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, act_fn_option, Y_data);
+      DEBUG("scale shift starting (LOOP_I = 8), N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, TPB, f, num_blocks, vec_elems);
+      if (vec_elems == 4 && act_fn_option == 0)
+        scale_shift<T, LOOP_I, 4, 0><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 2 && act_fn_option == 0)
+        scale_shift<T, LOOP_I, 2, 0><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 1 && act_fn_option == 0)
+        scale_shift<T, LOOP_I, 1, 0><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 4 && act_fn_option == 1)
+        scale_shift<T, LOOP_I, 4, 1><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 2 && act_fn_option == 1)
+        scale_shift<T, LOOP_I, 2, 1><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 1 && act_fn_option == 1)
+        scale_shift<T, LOOP_I, 1, 1><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 4 && act_fn_option == 2)
+        scale_shift<T, LOOP_I, 4, 2><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 2 && act_fn_option == 2)
+        scale_shift<T, LOOP_I, 2, 2><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      else if (vec_elems == 1 && act_fn_option == 2)
+        scale_shift<T, LOOP_I, 1, 2><<<dim3(num_blocks / vec_elems, f), TPB, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
     }
     else {// relatively slow fallback
       const int num_blocks = N * H * W;
-      DEBUG("SLOW FALLBACK, dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, C/f, f, num_blocks, vec_elems);
-      scale_shift<T, 1, 1><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, act_fn_option, Y_data);
+      DEBUG("SLOW FALLBACK, scale shift kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, C/f, f, num_blocks, vec_elems);
+      if (act_fn_option == 0)
+        scale_shift<T, 1, 1, 0><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      if (act_fn_option == 1)
+        scale_shift<T, 1, 1, 1><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
+      if (act_fn_option == 2)
+        scale_shift<T, 1, 1, 2><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, C, G, Y_data);
     }
   }
 
@@ -461,7 +477,7 @@ sum_reduce(
   __syncthreads();
 }
 
-template <typename T>
+template <typename T, int64_t act_fn_option>
 __global__ void
 width_reduce(
       const T* dy_data,
@@ -474,7 +490,6 @@ width_reduce(
       const int W,
       const int C,
       const int G,
-      const int64_t act_fn_option,
       typename acc_type<T>::type *xdy_dy_sum_data) {
   /*
   Loops over W (width) dimension, loading and summing dy, X, and the activation derivative of Y. Outputs stored in xdy_dy_sum_data. Spatial dimension H is processed in a separate kernel.
@@ -508,11 +523,12 @@ width_reduce(
   T_ACC fused_bias = -mean_data[ng] * fused_scale + bias_data[c];
 
   T (*act_d_fn)(T x);
-  switch (act_fn_option) {
-    case 0: act_d_fn = identity_d; break;
-    case 1: act_d_fn = relu_d; break;
-    case 2: act_d_fn = silu_d; break;
-  }
+  if constexpr (act_fn_option == 0)
+    act_d_fn = identity_d;
+  else if constexpr (act_fn_option == 1)
+    act_d_fn = relu_d;
+  else if constexpr (act_fn_option == 2)
+    act_d_fn = silu_d;
 
   const int w = ceil((float)W / d);
   int i;
@@ -715,7 +731,7 @@ compute_dweight_dbias(
   dbias_data[c] = sum2;
 }
 
-template <typename T, int LOOP_I, int vec_elems>
+template <typename T, int LOOP_I, int vec_elems, int64_t act_fn_option>
 __global__ void
 dx_elem_kernel(
     const T* dy_data,
@@ -727,7 +743,6 @@ dx_elem_kernel(
     const int N,
     const int C,
     const int G,
-    const int64_t act_fn_option,
     T* dx_data
     ) {
   /*
@@ -757,11 +772,12 @@ dx_elem_kernel(
   V_ACC coef2_vec = reinterpret_cast<V_ACC*>(coef2_data)[nc];
 
   T (*act_d_fn)(T);
-  switch (act_fn_option) {
-    case 0: act_d_fn = identity_d; break;
-    case 1: act_d_fn = relu_d; break;
-    case 2: act_d_fn = silu_d; break;
-  }
+  if constexpr (act_fn_option == 0)
+    act_d_fn = identity_d;
+  else if constexpr (act_fn_option == 1)
+    act_d_fn = relu_d;
+  else if constexpr (act_fn_option == 2)
+    act_d_fn = silu_d;
 
 #pragma unroll
   for (int i = 0; i < LOOP_I; ++i) {
@@ -842,12 +858,17 @@ void run_gn_bwd_kernels(
   {
     auto [TPB, d, f] = calc_block_params(W * C, C, G);
     DEBUG("starting width reduce, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
-    width_reduce<<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB, cuda_stream>>>(
-        dy_data, X_data, 
-        mean_data, rstd_data,
-        weight_data, bias_data,
-        H, W, C, G, act_fn_option,
-        xdy_dy_sum_data);
+    if (act_fn_option == 0)
+      width_reduce<T, 0><<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB, cuda_stream>>>(
+          dy_data, X_data, 
+          mean_data, rstd_data,
+          weight_data, bias_data,
+          H, W, C, G,
+          xdy_dy_sum_data);
+    else if (act_fn_option == 1)
+      width_reduce<T, 1><<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, xdy_dy_sum_data);
+    else if (act_fn_option == 2)
+      width_reduce<T, 2><<<dim3(N, H, f), dim3(TPB / d, d), sizeof(T_ACC) * 2 * TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, xdy_dy_sum_data);
   }
 
   T_ACC* xdy_sum_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C);
@@ -900,17 +921,34 @@ void run_gn_bwd_kernels(
       const int LOOP_I = 8;
       const int num_blocks = ceil((float)N * H * W * C / TPB / LOOP_I / f);
       DEBUG("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, TPB, f, num_blocks, vec_elems);
-      if (D % 4 == 0)
-        dx_elem_kernel<T, LOOP_I, 4><<<dim3(num_blocks / 4, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, act_fn_option, dx_data);
-      else if (D % 2 == 0)
-        dx_elem_kernel<T, LOOP_I, 2><<<dim3(num_blocks / 2, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, act_fn_option, dx_data);
-      else
-        dx_elem_kernel<T, LOOP_I, 1><<<dim3(num_blocks / 1, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, act_fn_option, dx_data);
+      if (D % 4 == 0 && act_fn_option == 0)
+        dx_elem_kernel<T, LOOP_I, 4, 0><<<dim3(num_blocks / 4, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (D % 2 == 0 && act_fn_option == 0)
+        dx_elem_kernel<T, LOOP_I, 2, 0><<<dim3(num_blocks / 2, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (D % 1 == 0 && act_fn_option == 0)
+        dx_elem_kernel<T, LOOP_I, 1, 0><<<dim3(num_blocks / 1, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (D % 4 == 0 && act_fn_option == 1)
+        dx_elem_kernel<T, LOOP_I, 4, 1><<<dim3(num_blocks / 4, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (D % 2 == 0 && act_fn_option == 1)
+        dx_elem_kernel<T, LOOP_I, 2, 1><<<dim3(num_blocks / 2, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (D % 1 == 0 && act_fn_option == 1)
+        dx_elem_kernel<T, LOOP_I, 1, 1><<<dim3(num_blocks / 1, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (D % 4 == 0 && act_fn_option == 2)
+        dx_elem_kernel<T, LOOP_I, 4, 2><<<dim3(num_blocks / 4, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (D % 2 == 0 && act_fn_option == 2)
+        dx_elem_kernel<T, LOOP_I, 2, 2><<<dim3(num_blocks / 2, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (D % 1 == 0 && act_fn_option == 2)
+        dx_elem_kernel<T, LOOP_I, 1, 2><<<dim3(num_blocks / 1, f), TPB, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
     }
     else { // relatively slow fallback
       const int num_blocks = N * H * W;
       DEBUG("SLOW FALLBACK, dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d, num blocks (before vectors): %d, vec_elems: %d\n", N, H, W, C, G, D, C/f, f, num_blocks, vec_elems);
-      dx_elem_kernel<T, 1, 1><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, act_fn_option, dx_data);
+      if (act_fn_option == 0)
+        dx_elem_kernel<T, 1, 1, 0><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (act_fn_option == 1)
+        dx_elem_kernel<T, 1, 1, 1><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
+      else if (act_fn_option == 2)
+        dx_elem_kernel<T, 1, 1, 2><<<dim3(num_blocks, f), C / f, 0, cuda_stream>>>(dy_data, X_data, coef1_data, coef2_data, coef3_data, coef4_data, N,  C, G, dx_data);
     }
   }
 
