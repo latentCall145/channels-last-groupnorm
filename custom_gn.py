@@ -1,3 +1,4 @@
+from tqdm import tqdm
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
@@ -140,7 +141,7 @@ if __name__ == '__main__':
 
     if MODE != 'bench':
         #DTYPEs = (torch.bfloat16, torch.float, torch.double)
-        DTYPEs = (torch.float,)
+        DTYPEs = (torch.bfloat16,)
         Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
         Cs = (
                 32, 64, 128, 256, 512,
@@ -156,26 +157,26 @@ if __name__ == '__main__':
         all_params = itertools.product(DTYPEs, Bs, Cs, Rs, Gs)
 
         err_inputs = []
-        for params in sorted(
-                #filter(config_filter, all_params),
-                [
-                    (torch.float, 2, 1280, 8, 32),
-                    (torch.float, 2, 640, 16, 32),
-                    (torch.float, 2, 2560, 8, 32),
-                    (torch.float, 2, 1280, 16, 32),
-                    (torch.float, 2, 320, 32, 32),
-                    (torch.float, 2, 1920, 16, 32),
-                    (torch.float, 2, 2560, 16, 32),
-                    (torch.float, 2, 640, 32, 32),
-                    (torch.float, 2, 960, 32, 32),
-                    (torch.float, 2, 1280, 32, 32),
-                    (torch.float, 2, 320, 64, 32),
-                    (torch.float, 2, 1920, 32, 32),
-                    (torch.float, 2, 640, 64, 32),
-                    (torch.float, 2, 960, 64, 32),
-                ],
+        for params in tqdm(sorted(
+                filter(config_filter, all_params),
+                #[
+                #    (torch.float, 2, 1280, 8, 32),
+                #    (torch.float, 2, 640, 16, 32),
+                #    (torch.float, 2, 2560, 8, 32),
+                #    (torch.float, 2, 1280, 16, 32),
+                #    (torch.float, 2, 320, 32, 32),
+                #    (torch.float, 2, 1920, 16, 32),
+                #    (torch.float, 2, 2560, 16, 32),
+                #    (torch.float, 2, 640, 32, 32),
+                #    (torch.float, 2, 960, 32, 32),
+                #    (torch.float, 2, 1280, 32, 32),
+                #    (torch.float, 2, 320, 64, 32),
+                #    (torch.float, 2, 1920, 32, 32),
+                #    (torch.float, 2, 640, 64, 32),
+                #    (torch.float, 2, 960, 64, 32),
+                #],
                 key = lambda x: x[1]*x[2]*x[3]*x[4]
-        ):
+        )):
             DTYPE, B, C, R, G = params
             #torch.cuda.empty_cache()
             print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
@@ -220,6 +221,7 @@ if __name__ == '__main__':
                 g2 = gn2(x)
                 g3 = act_fn(gn3(x))
                 rand_dy = torch.rand_like(g3)
+                rand_dy /= rand_dy.numel() ** 0.5 # to prevent false positive errors from ocurring because of really large magnitude losses
                 g1sum = (g1 * rand_dy).sum()
                 g2sum = (g2 * rand_dy).sum()
                 g3sum = (g3 * rand_dy).sum()

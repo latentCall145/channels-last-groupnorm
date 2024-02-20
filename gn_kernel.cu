@@ -1,6 +1,5 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/core/ScalarType.h>
-#include <c10/util/BFloat16.h>
 #include <thrust/pair.h>
 #include "gn_kernel.h"
 #include "Welford.h"
@@ -277,8 +276,8 @@ compute_stats_pt2(
     T_ACC mean, var;
     thrust::tie(var, mean) = welford_op.project(vals_reduced[tid]);
     int out_idx = 0;
-    out_idx += blockIdx.x * G; // dim 0, G stride
-    out_idx += blockIdx.y; // dim 1, G/f stride
+    out_idx += blockIdx.x * G;
+    out_idx += blockIdx.y;
     means[out_idx] = mean;
     rstds[out_idx] = rsqrt(var + static_cast<T_ACC>(eps));
   }
@@ -295,7 +294,6 @@ scale_shift(
     const int N,
     const int C,
     const int G,
-    //const int64_t act_fn_option,
     T* y
     ) {
   /*
