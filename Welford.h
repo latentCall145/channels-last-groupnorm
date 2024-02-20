@@ -2,7 +2,7 @@
 #ifndef WELFORD_H 
 #define WELFORD_H 
 
-#include <c10/cuda/CUDAMathCompat.h> // rsqrt
+#include <c10/cuda/CUDAMathCompat.h> // C10_HOST_DEVICE
 
 // copied from https://github.com/pytorch/pytorch/blob/b8307513e57f8beaf99daff342a23d705a417e11/aten/src/ATen/native/SharedReduceOps.h
 template <typename scalar_t, typename index_t>

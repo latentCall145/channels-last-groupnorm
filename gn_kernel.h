@@ -1,7 +1,6 @@
 #pragma once
 #ifndef FWD_GN_KERNEL_H
 #define FWD_GN_KERNEL_H
-#include <ATen/Tensor.h>
 
 template <typename T>
 void run_gn_fwd_kernels(

@@ -11,13 +11,10 @@ gn_op = load(
         sources=[
             os.path.join(module_dir, "custom_gn.cpp"),
             os.path.join(module_dir, "gn_kernel.cu"),
-            #os.path.join(module_dir, "NH_grid_gn_kernel.cu"),
-            #os.path.join(module_dir, "bwd_gn_kernel.cu"),
             #os.path.join(module_dir, "nchw_kernel.cu")
             ],
         extra_cuda_cflags=[
             '-use_fast_math',
-            '--extended-lambda', # necessary flag to use gpu_kernel in CUDA kernels
             '-lineinfo', # useful for profiling
             ],
         extra_cflags=[

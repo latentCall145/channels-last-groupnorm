@@ -1,7 +1,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/core/ScalarType.h>
 #include <c10/util/BFloat16.h>
-#include <thrust/pair.h> // thrust::pair
+#include <thrust/pair.h>
 #include "gn_kernel.h"
 #include "Welford.h"
 #include "vecs.h"
@@ -16,7 +16,7 @@
 #define DEBUG(format, args...) ((void)0)
 #endif
 #define ELEM_DEBUG 0
-#define INT int
+#define INT int // torch uses int64_t but this came at a pretty big hit to performance and the input sizes that I frequently use (resolutions no bigger than 1024x1024) have a number of pixels smaller than the int max value
 
 template <typename T>
 struct acc_type { using type = float; };

@@ -1,3 +1,7 @@
+#pragma once
+#ifndef VECS_H
+#define VECS_H
+
 template <typename T, int num_elems>
 struct float_vec;
 
@@ -27,3 +31,5 @@ struct alignas(4 * sizeof(T)) float_vec<T, 4> {
       return { static_cast<U>(x), static_cast<U>(y), static_cast<U>(z), static_cast<U>(w), };
   }
 };
+
+#endif
