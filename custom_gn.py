@@ -45,13 +45,17 @@ class GN_NHWC_Func(torch.autograd.Function):
 class GN_NHWC(nn.GroupNorm):
     def __init__(self, num_groups: int, nc: int, activation='identity', **kwargs):
         super().__init__(num_groups, nc, **kwargs)
-        assert activation in {'identity', 'silu', 'relu'}
+        assert activation in {'identity', 'silu', 'relu', 'gelu', 'gelu_tanh'}
         if activation == 'identity':
             self.activation = 0
         if activation == 'relu':
             self.activation = 1
         if activation == 'silu':
             self.activation = 2
+        if activation == 'gelu':
+            self.activation = 3
+        if activation == 'gelu_tanh':
+            self.activation = 4
 
     @torch._dynamo.disable
     def forward(self, x):
@@ -207,6 +211,10 @@ if __name__ == '__main__':
                     act_fn = lambda x: x
                 if ACT_FN == 'relu':
                     act_fn = F.relu
+                if ACT_FN == 'gelu':
+                    act_fn = F.gelu
+                if ACT_FN == 'gelu_tanh':
+                    act_fn = lambda x: F.gelu(x, approximate='tanh')
 
                 g1 = act_fn(gn1(x.float()))
                 g2 = gn2(x)
