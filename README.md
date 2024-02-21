@@ -30,6 +30,8 @@ from gnNHWC.custom_gn import GN_NHWC # if running from outside the gnNHWC folder
 GN_NHWC(32, 128, activation='identity') # replaces nn.GroupNorm(32, 128)
 GN_NHWC(32, 128, activation='relu') # replaces nn.GroupNorm(32, 128) and nn.ReLU()
 GN_NHWC(32, 128, activation='silu') # replaces nn.GroupNorm(32, 128) and nn.SiLU()
+GN_NHWC(32, 128, activation='gelu') # replaces nn.GroupNorm(32, 128) and nn.GeLU()
+GN_NHWC(32, 128, activation='gelu_tanh') # replaces nn.GroupNorm(32, 128) and nn.GeLU(approximate='tanh')
 ```
 
 ## Performance

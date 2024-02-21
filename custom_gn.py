@@ -131,11 +131,17 @@ def config_filter(x): # returns true if config is valid
     return True
 
 if __name__ == '__main__':
-    #DTYPE = torch.double
-    #DTYPE = torch.float
-    #DTYPE = torch.bfloat16
     ACT_FN = 'silu'
-    #print('DTYPE:', DTYPE)
+    if ACT_FN == 'silu':
+        act_fn = F.silu
+    if ACT_FN == 'identity':
+        act_fn = lambda x: x
+    if ACT_FN == 'relu':
+        act_fn = F.relu
+    if ACT_FN == 'gelu':
+        act_fn = F.gelu
+    if ACT_FN == 'gelu_tanh':
+        act_fn = lambda x: F.gelu(x, approximate='tanh')
     MODE = 'check' # can be 'check', 'bench', other modes do both
     CHECK_PROF = False
 
@@ -158,23 +164,23 @@ if __name__ == '__main__':
 
         err_inputs = []
         for params in tqdm(sorted(
-                filter(config_filter, all_params),
-                #[
-                #    (torch.float, 2, 1280, 8, 32),
-                #    (torch.float, 2, 640, 16, 32),
-                #    (torch.float, 2, 2560, 8, 32),
-                #    (torch.float, 2, 1280, 16, 32),
-                #    (torch.float, 2, 320, 32, 32),
-                #    (torch.float, 2, 1920, 16, 32),
-                #    (torch.float, 2, 2560, 16, 32),
-                #    (torch.float, 2, 640, 32, 32),
-                #    (torch.float, 2, 960, 32, 32),
-                #    (torch.float, 2, 1280, 32, 32),
-                #    (torch.float, 2, 320, 64, 32),
-                #    (torch.float, 2, 1920, 32, 32),
-                #    (torch.float, 2, 640, 64, 32),
-                #    (torch.float, 2, 960, 64, 32),
-                #],
+                #filter(config_filter, all_params),
+                [
+                    (torch.bfloat16, 2, 1280, 8, 32),
+                    (torch.bfloat16, 2, 640, 16, 32),
+                    (torch.bfloat16, 2, 2560, 8, 32),
+                    (torch.bfloat16, 2, 1280, 16, 32),
+                    (torch.bfloat16, 2, 320, 32, 32),
+                    (torch.bfloat16, 2, 1920, 16, 32),
+                    (torch.bfloat16, 2, 2560, 16, 32),
+                    (torch.bfloat16, 2, 640, 32, 32),
+                    (torch.bfloat16, 2, 960, 32, 32),
+                    (torch.bfloat16, 2, 1280, 32, 32),
+                    (torch.bfloat16, 2, 320, 64, 32),
+                    (torch.bfloat16, 2, 1920, 32, 32),
+                    (torch.bfloat16, 2, 640, 64, 32),
+                    (torch.bfloat16, 2, 960, 64, 32),
+                ],
                 key = lambda x: x[1]*x[2]*x[3]*x[4]
         )):
             DTYPE, B, C, R, G = params
@@ -205,17 +211,6 @@ if __name__ == '__main__':
                     gn2.bias.copy_(b.detach())
                     gn3.weight.copy_(w.detach())
                     gn3.bias.copy_(b.detach())
-
-                if ACT_FN == 'silu':
-                    act_fn = F.silu
-                if ACT_FN == 'identity':
-                    act_fn = lambda x: x
-                if ACT_FN == 'relu':
-                    act_fn = F.relu
-                if ACT_FN == 'gelu':
-                    act_fn = F.gelu
-                if ACT_FN == 'gelu_tanh':
-                    act_fn = lambda x: F.gelu(x, approximate='tanh')
 
                 g1 = act_fn(gn1(x.float()))
                 g2 = gn2(x)
@@ -272,21 +267,22 @@ if __name__ == '__main__':
 
     if MODE != 'check':
         NSEC = 1 # number of seconds that each kernel runs for on a certain input
+        DTYPES = [torch.bfloat16]
         BATCHES = [1, 2, 4, 8, 16, 32]
         #CHANNELS = [32, 64, 128, 256, 512]
         CHANNELS = [320, 640, 960, 1920, 2560]
         RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
         #NUM_GROUPS = [4, 8, 16, 32, 64, 128]
         NUM_GROUPS = [32]
-        BENCH = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
+        BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
         GN_KERNELS = [
                 #(GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
                 #(GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
                 #(GN_NHWC, 'GN NHWC N grid (custom op)', gn_op.fwd_N_grid),
                 #(GN_NHWC, 'GN NHWC NG grid NG grid (custom op)', gn_op.fwd_NG_grid),
                 #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', gn_op.nchwforward),
-                #(nn.GroupNorm, 'torch.nn GN NCHW', None),
-                (GN_NCHW, 'torch.nn GN NCHW (compiled from src)', None),
+                (nn.GroupNorm, 'torch.nn GN NCHW', None),
+                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', None),
                 (GN_NHWC, 'GN NHWC', None),
         ]
 
@@ -296,10 +292,10 @@ if __name__ == '__main__':
         outfile = open(fname, 'w')
         outfile.write('Kernel,B (batch),C (num channels),R (resolution),G (num groups), D (C/G),Speed (it/s; 25th percentile),Speed (it/s; 50th percentile),Speed (it/s; 75th percentile)\n')
         
-        configs = list(filter(config_filter, itertools.product(BATCHES, CHANNELS, RESOLUTIONS, NUM_GROUPS)))
+        configs = list(filter(config_filter, itertools.product(DTYPES, BATCHES, CHANNELS, RESOLUTIONS, NUM_GROUPS)))
         print('Estimated time (seconds) to complete:', NSEC * len(configs) * len(GN_KERNELS))
 
-        for B, C, R, G in configs:
+        for DTYPE, B, C, R, G in configs:
             x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
 
@@ -312,6 +308,9 @@ if __name__ == '__main__':
                 try:
                     gn_layer = gn_class(*gn_args).cuda().to(DTYPE)
                     g = gn_layer(gn_input)
+                    if not isinstance(gn_layer, GN_NHWC):
+                        g = act_fn(g)
+
                     torch.cuda.synchronize()
 
                     tic = time.time()
@@ -328,6 +327,8 @@ if __name__ == '__main__':
                                 g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps) # Not calling gn_layer(gn_input) since I found this added a lot of overhead
                         elif BENCH == 'both':
                             g = gn_layer(gn_input)
+                        if not isinstance(gn_layer, GN_NHWC):
+                            g = act_fn(g)
                         if BENCH != 'fwd':
                             torch.autograd.grad(g.sum(), gn_input, retain_graph=True)
                         torch.cuda.synchronize()
