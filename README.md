@@ -46,3 +46,6 @@ The CUDA kernels also compile about 5x faster than PyTorch's native GN CUDA kern
 - [X] Python wrapper for fused forward activation (e.g. fused GN + Silu)
 - [x] Backward pass with fused activation gradients
 - [ ] TorchDynamo functionality?
+
+## Other
+I wrote a writeup on the math behind the forward/backward pass for GN + fused activation. Check it out [here](https://drive.google.com/file/d/1c-FvwCT6FWw5eYI-MqyNc311mrnKV6un/view?usp=sharing)!
