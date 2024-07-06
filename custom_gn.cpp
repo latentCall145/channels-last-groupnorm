@@ -84,7 +84,64 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_bwd(
   return {dX.permute({0, 3, 1, 2}), dweight, dbias};
 }
 
+std::vector<at::Tensor> gn_nchw_fwd(
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor bias,
+    const int64_t G,
+    double eps) {
+  CHECK_CUDA(X);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(bias);
+  const int64_t N = X.size(0);
+  const int64_t C = X.size(1);
+  const int64_t H = X.size(2);
+  const int64_t W = X.size(3);
+  at::Tensor Y = at::empty_like(X);
+  at::Tensor mean = at::empty({N, G}, X.options());
+  at::Tensor rstd = at::empty({N, G}, X.options());
+  GroupNormKernelImpl(
+    X, weight, bias,
+    N, C, H * W,
+    G,
+    eps,
+    Y,
+    mean,
+    rstd);
+  return {Y, mean, rstd};
+}
+
+std::vector<at::Tensor> gn_nchw_bwd(
+    const at::Tensor dy,
+    const at::Tensor X,
+    const at::Tensor weight,
+    const at::Tensor means,
+    const at::Tensor rstds,
+    const int64_t G) {
+  CHECK_CUDA(dy);
+  CHECK_CUDA(X);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(means);
+  CHECK_CUDA(rstds);
+  const int64_t N = X.size(0);
+  const int64_t C = X.size(1);
+  const int64_t H = X.size(2);
+  const int64_t W = X.size(3);
+  at::Tensor dX = at::empty_like(X);
+  at::Tensor dgamma = at::empty_like(weight);
+  at::Tensor dbeta = at::empty_like(weight);
+  GroupNormBackwardKernelImpl(
+      dy, X,
+      means, rstds, weight,
+      N, C, H * W, G,
+      dX, dgamma, dbeta);
+
+  return {dX, dgamma, dbeta};
+}
+
 TORCH_LIBRARY(gnop, m) {
+  m.def("nchw_fwd", &gn_nchw_fwd);
+  m.def("nchw_bwd", &gn_nchw_bwd);
   m.def("fwd", &gn_nhwc_fwd);
   m.def("bwd", &gn_nhwc_bwd);
 }

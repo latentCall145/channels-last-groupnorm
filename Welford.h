@@ -2,7 +2,7 @@
 #ifndef WELFORD_H 
 #define WELFORD_H 
 
-#include <c10/cuda/CUDAMathCompat.h> // C10_HOST_DEVICE
+#include <c10/cuda/CUDAMathCompat.h> // for C10_HOST_DEVICE and __ubsan_ignore_float_divide_by_zero__
 
 // copied from https://github.com/pytorch/pytorch/blob/b8307513e57f8beaf99daff342a23d705a417e11/aten/src/ATen/native/SharedReduceOps.h
 template <typename scalar_t, typename index_t>
@@ -11,8 +11,6 @@ struct WelfordData {
   scalar_t m2;
   index_t n;
   scalar_t nf;
-
-  C10_HOST_DEVICE WelfordData() : mean(0), m2(0), n(0), nf(0) {}
 
   C10_HOST_DEVICE WelfordData(
       scalar_t mean,
@@ -73,20 +71,6 @@ struct WelfordOps {
     return results;
   }
 
-  static C10_DEVICE acc_t translate_idx(acc_t acc, int64_t /*base_idx*/) {
-    return acc;
-  }
-
-#if defined(__CUDACC__) || defined(__HIPCC__)
-  inline __device__ acc_t warp_shfl_down(acc_t acc, int offset) const {
-    return {
-      WARP_SHFL_DOWN(acc.mean, offset)
-      , WARP_SHFL_DOWN(acc.m2, offset)
-      , WARP_SHFL_DOWN(acc.n, offset)
-      , WARP_SHFL_DOWN(acc.nf, offset)
-    };
-  }
-#endif
   C10_HOST_DEVICE WelfordOps(acc_scalar_t correction, bool take_sqrt)
       : correction(correction), take_sqrt(take_sqrt) {}
 };

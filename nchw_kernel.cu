@@ -1,20 +1,18 @@
-// Copied from https://github.com/pytorch/pytorch/blob/8852bb561cbc821ffebf395990ee12a7ea376612/aten/src/ATen/native/cuda/group_norm_kernel.cu with slight style modifications
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/group_norm.h>
 
-#include <type_traits>
-
-#include <thrust/tuple.h>
-
-//#include <ATen/core/Tensor.h>
 #include <ATen/AccumulateType.h>
 #include <ATen/Dispatch.h>
+#include <ATen/core/Tensor.h>
 #include <ATen/native/SharedReduceOps.h>
 #include <ATen/native/TensorIterator.h>
+#include <c10/core/MemoryFormat.h>
 #include <c10/cuda/CUDAMathCompat.h>
+#include <thrust/tuple.h>
 #include <ATen/cuda/detail/IndexUtils.cuh>
 #include <ATen/native/cuda/Loops.cuh>
 #include <ATen/native/cuda/block_reduce.cuh>
+#include <type_traits>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -26,8 +24,12 @@ constexpr int kCUDANumThreads = 256;
 constexpr int kReduceTileSize = 32;
 
 template <typename T>
-__global__ void RowwiseMomentsCUDAKernelF(
+__global__ void RowwiseMomentsCUDAKernelNHWC(
     int64_t N,
+    int64_t H,
+    int64_t W,
+    int64_t C,
+    int64_t G,
     T eps,
     const T* X,
     T* mean,
@@ -37,11 +39,63 @@ __global__ void RowwiseMomentsCUDAKernelF(
   using WelfordOp =
       at::native::WelfordOps<T_ACC, T_ACC, int64_t, thrust::pair<T_ACC, T_ACC>>;
 
+  const int64_t channels_per_group = C / G;
+  const int64_t batch_index = blockIdx.x / G;
+  const int64_t ng = blockIdx.x % G;
+  const int64_t batch_offset = batch_index * H * W * C;
+  const int64_t group_offset = ng * channels_per_group;
+  const int64_t start = batch_offset + group_offset;
+
+  WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
+  WelfordType val(0, 0, 0, 0);
+  for (int64_t j = threadIdx.x; j < H * W; j += blockDim.x) {
+    for (int64_t c = 0; c < channels_per_group; ++c) {
+      const int64_t index = start + j * C + c;
+      val = welford_op.reduce(val, static_cast<T_ACC>(X[index]), index);
+    }
+  }
+
+  if (blockDim.x <= C10_WARP_SIZE) {
+    val = at::native::cuda_utils::WarpReduce(val, welford_op);
+  } else {
+    __shared__ typename std::aligned_storage<
+        sizeof(WelfordType),
+        alignof(WelfordType)>::type val_shared[C10_WARP_SIZE];
+    WelfordType* val_shared_ptr = reinterpret_cast<WelfordType*>(val_shared);
+    val = at::native::cuda_utils::BlockReduce(
+        val,
+        welford_op,
+        /*identity_element=*/WelfordType(0, 0, 0, 0),
+        val_shared_ptr);
+  }
+
+  if (threadIdx.x == 0) {
+    T_ACC m1;
+    T_ACC m2;
+    thrust::tie(m2, m1) = welford_op.project(val);
+    mean[blockIdx.x] = m1;
+    rstd[blockIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
+  }
+}
+
+template <typename T>
+__global__ void RowwiseMomentsCUDAKernel(
+    int64_t group_span,
+    T eps,
+    const T* X,
+    T* mean,
+    T* rstd,
+    int64_t C) {
+  using T_ACC = at::acc_type<T, true>;
+  using WelfordType = at::native::WelfordData<T_ACC, int64_t>;
+  using WelfordOp =
+      at::native::WelfordOps<T_ACC, T_ACC, int64_t, thrust::pair<T_ACC, T_ACC>>;
+
   const int64_t i = blockIdx.x;
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
   WelfordType val(0, 0, 0, 0);
-  for (int64_t j = threadIdx.x; j < N; j += blockDim.x) {
-    const int64_t index = i * N + j;
+  for (int64_t j = threadIdx.x; j < group_span; j += blockDim.x) {
+    const int64_t index = i * group_span + j;
     val = welford_op.reduce(val, static_cast<T_ACC>(X[index]), index);
   }
   if (blockDim.x <= C10_WARP_SIZE) {
@@ -69,7 +123,7 @@ __global__ void RowwiseMomentsCUDAKernelF(
 }
 
 template <typename T>
-__global__ void ComputeFusedParamsCUDAKernelF(
+__global__ void ComputeFusedParamsCUDAKernel(
     int64_t N,
     int64_t C,
     int64_t group,
@@ -94,7 +148,7 @@ __global__ void ComputeFusedParamsCUDAKernelF(
 }
 
 template <typename T>
-__global__ void Compute1dBackwardFusedParamsCUDAKernelF(
+__global__ void Compute1dBackwardFusedParamsCUDAKernel(
     int64_t C,
     int64_t group,
     const T* dY,
@@ -134,7 +188,6 @@ __global__ void Compute1dBackwardFusedParamsCUDAKernelF(
     const T_ACC x = (sum2 * static_cast<T_ACC>(mean[ng]) - sum1) *
         static_cast<T_ACC>(rstd[ng]) * static_cast<T_ACC>(rstd[ng]) *
         static_cast<T_ACC>(rstd[ng]) * s;
-    //printf("\n\nng: %d, x: %f\n\n", (int)ng, x);
     c2[ng] = x;
     c3[ng] = -x * static_cast<T_ACC>(mean[ng]) -
         sum2 * static_cast<T_ACC>(rstd[ng]) * s;
@@ -142,7 +195,7 @@ __global__ void Compute1dBackwardFusedParamsCUDAKernelF(
 }
 
 template <typename T>
-__global__ void GammaBeta1dBackwardCUDAKernelF1(
+__global__ void GammaBeta1dBackwardCUDAKernel1(
     int64_t N,
     int64_t C,
     int64_t group,
@@ -180,7 +233,7 @@ __global__ void GammaBeta1dBackwardCUDAKernelF1(
 }
 
 template <typename T>
-__global__ void GammaBeta1dBackwardCUDAKernelF2(
+__global__ void GammaBeta1dBackwardCUDAKernel2(
     int64_t N,
     int64_t C,
     int64_t group,
@@ -273,7 +326,7 @@ __global__ void GammaBeta1dBackwardCUDAKernelF2(
 }
 
 template <typename T>
-__global__ void ComputeInternalGradientsCUDAKernelF(
+__global__ void ComputeInternalGradientsCUDAKernel(
     int64_t HxW,
     const T* dY,
     const T* X,
@@ -304,7 +357,7 @@ __global__ void ComputeInternalGradientsCUDAKernelF(
 }
 
 template <typename T>
-__global__ void ComputeBackwardFusedParamsCUDAKernelF(
+__global__ void ComputeBackwardFusedParamsCUDAKernel(
     int64_t C,
     int64_t HxW,
     int64_t group,
@@ -352,7 +405,7 @@ __global__ void ComputeBackwardFusedParamsCUDAKernelF(
 }
 
 template <typename T>
-__global__ void GammaBetaBackwardCUDAKernelF1(
+__global__ void GammaBetaBackwardCUDAKernel1(
     int64_t N,
     int64_t C,
     int64_t group,
@@ -388,7 +441,7 @@ __global__ void GammaBetaBackwardCUDAKernelF1(
 }
 
 template <typename T>
-__global__ void GammaBetaBackwardCUDAKernelF2(
+__global__ void GammaBetaBackwardCUDAKernel2(
     int64_t N,
     int64_t C,
     int64_t group,
@@ -568,20 +621,48 @@ void GroupNormKernelImplInternal(
   if (N == 0) {
     return;
   }
+
   const int64_t G = group;
   const int64_t D = C / G;
   const T* X_data = X.const_data_ptr<T>();
+  T* Y_data = Y.mutable_data_ptr<T>();
   T* mean_data = mean.mutable_data_ptr<T>();
   T* rstd_data = rstd.mutable_data_ptr<T>();
+
+  at::MemoryFormat x_format = X.suggest_memory_format();
+  Y.is_contiguous(x_format);
 
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
   const int64_t num_threads = D * HxW < at::native::cuda_utils::kCUDABlockReduceNumThreads
       ? at::cuda::warp_size()
       : at::native::cuda_utils::kCUDABlockReduceNumThreads;
-  RowwiseMomentsCUDAKernelF<T><<<N * G, num_threads, 0, cuda_stream>>>(
-      D * HxW, eps, X_data, mean_data, rstd_data);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+  int height;
+  int width;
+
+  switch (x_format) {
+    case at::MemoryFormat::Contiguous: {
+      RowwiseMomentsCUDAKernel<T><<<N * G, num_threads, 0, cuda_stream>>>(
+          D * HxW, eps, X_data, mean_data, rstd_data, C);
+      break;
+    }
+    case at::MemoryFormat::ChannelsLast: {
+      height = X.size(2);
+      width = X.size(3);
+
+      RowwiseMomentsCUDAKernelNHWC<T><<<N * G, num_threads, 0, cuda_stream>>>(
+          N, height, width, C, G, eps, X_data, mean_data, rstd_data);
+
+      break;
+    }
+    default: {
+      TORCH_CHECK(
+          false,
+          "Unsupported memory format for group normalization: ",
+          x_format);
+    }
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   if (HxW == 1) {
     GroupNorm1dForward<T>(X, mean, rstd, gamma, beta, N, C, G, Y);
   } else if (!gamma.defined() && !beta.defined()) {
@@ -592,6 +673,7 @@ void GroupNormKernelImplInternal(
                     .add_owned_input(mean.view({N * G, 1}))
                     .add_owned_input(rstd.view({N * G, 1}))
                     .build();
+
     at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd) -> T {
       return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) *
           static_cast<T_ACC>(rstd);
@@ -603,31 +685,59 @@ void GroupNormKernelImplInternal(
         : X.scalar_type();
     at::Tensor a = at::empty({N, C}, X.options().dtype(kAccType));
     at::Tensor b = at::empty({N, C}, X.options().dtype(kAccType));
+
     const T* gamma_data = gamma.defined() ? gamma.const_data_ptr<T>() : nullptr;
     const T* beta_data = beta.defined() ? beta.const_data_ptr<T>() : nullptr;
     T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
     T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
 
-    // TODO: Since there is some issues in at::native::gpu_kernel_multiple_outputs, we are
-    // using maunal kernel here. Make it using at::native::gpu_kernel_multiple_outputs once
+    // TODO: Since there is some issues in gpu_kernel_multiple_outputs, we are
+    // using manual kernel here. Make it using gpu_kernel_multiple_outputs once
     // the issue fixed.
     const int64_t B = (N * C + kCUDANumThreads - 1) / kCUDANumThreads;
-    ComputeFusedParamsCUDAKernelF<T><<<B, kCUDANumThreads, 0, cuda_stream>>>(
+
+    ComputeFusedParamsCUDAKernel<T><<<B, kCUDANumThreads, 0, cuda_stream>>>(
         N, C, G, mean_data, rstd_data, gamma_data, beta_data, a_data, b_data);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    auto iter = at::TensorIteratorConfig()
-                    .check_all_same_dtype(std::is_same<T, T_ACC>::value)
-                    .resize_outputs(false)
-                    .add_owned_output(Y.view({N * C, HxW}))
-                    .add_owned_input(X.view({N * C, HxW}))
-                    .add_owned_input(a.view({N * C, 1}))
-                    .add_owned_input(b.view({N * C, 1}))
-                    .build();
-    at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
-      return a * static_cast<T_ACC>(x) + b;
-    });
+    switch (x_format) {
+      case at::MemoryFormat::Contiguous: {
+        auto iter =
+            at::TensorIteratorConfig()
+                .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                .resize_outputs(false)
+                .add_owned_output(Y.view({N * C, HxW}))
+                .add_owned_input(X.view({N * C, HxW}))
+                .add_owned_input(a.view({N * C, 1}))
+                .add_owned_input(b.view({N * C, 1}))
+                .build();
+        at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
+          return a * static_cast<T_ACC>(x) + b;
+        });
+
+        break;
+      }
+      case at::MemoryFormat::ChannelsLast: {
+        auto iter =
+            at::TensorIteratorConfig()
+                .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                .resize_outputs(false)
+                .add_owned_output(Y)
+                .add_owned_input(X)
+                .add_owned_input(a.view({N, C, 1, 1}))
+                .add_owned_input(b.view({N, C, 1, 1}))
+                .build();
+        at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
+          return a * static_cast<T_ACC>(x) + b;
+        });
+
+        break;
+      }
+      default:
+        break; // shouldn't hit this
+    }
   }
+
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -699,7 +809,7 @@ void GroupNorm1dBackward(
     const int64_t num_threads = (C / G) < at::native::cuda_utils::kCUDABlockReduceNumThreads
         ? at::cuda::warp_size()
         : at::native::cuda_utils::kCUDABlockReduceNumThreads;
-    Compute1dBackwardFusedParamsCUDAKernelF<T>
+    Compute1dBackwardFusedParamsCUDAKernel<T>
         <<<dim3(N, G), num_threads, 0, cuda_stream>>>(
             C,
             G,
@@ -710,11 +820,6 @@ void GroupNorm1dBackward(
             gamma_data,
             c2_data,
             c3_data);
-    //std::cout << "mean: " << mean << '\n';
-    //std::cout << "rstd: " << rstd << '\n';
-    //std::cout << "g: " << gamma << '\n';
-    //std::cout << "c2: " << c2 << '\n';
-    //std::cout << "c3: " << c3 << '\n';
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     if (gamma.defined()) {
@@ -761,7 +866,7 @@ void GroupNorm1dBackward(
     T* dbeta_data = dbeta.defined() ? dbeta.mutable_data_ptr<T>() : nullptr;
     if (N <= 128) {
       const int64_t B = (C + kCUDANumThreads - 1) / kCUDANumThreads;
-      GammaBeta1dBackwardCUDAKernelF1<T><<<B, kCUDANumThreads, 0, cuda_stream>>>(
+      GammaBeta1dBackwardCUDAKernel1<T><<<B, kCUDANumThreads, 0, cuda_stream>>>(
           N,
           C,
           G,
@@ -775,11 +880,11 @@ void GroupNorm1dBackward(
     } else {
       const int64_t B = (C + kReduceTileSize - 1) / kReduceTileSize;
       // The algorithm for colwise reduction here is to accumulate each 32 cols
-      // to a 32 * 32 tile and write the tile to shared memmory. Then do warp
+      // to a 32 * 32 tile and write the tile to shared memory. Then do warp
       // reduce for each col in the tile. So here the blockDim must be (32, 16).
       constexpr int kThreadX = kReduceTileSize;
       constexpr int kThreadY = kReduceTileSize / 2;
-      GammaBeta1dBackwardCUDAKernelF2<T>
+      GammaBeta1dBackwardCUDAKernel2<T>
           <<<B, dim3(kThreadX, kThreadY), 0, cuda_stream>>>(
               N,
               C,
@@ -853,11 +958,9 @@ void GroupNormBackwardKernelImplInternal(
   int64_t num_threads = HxW < at::native::cuda_utils::kCUDABlockReduceNumThreads
       ? warp_size
       : at::native::cuda_utils::kCUDABlockReduceNumThreads;
-  ComputeInternalGradientsCUDAKernelF<T><<<N * C, num_threads, 0, cuda_stream>>>(
+  ComputeInternalGradientsCUDAKernel<T><<<N * C, num_threads, 0, cuda_stream>>>(
       HxW, dY_data, X_data, ds_data, db_data);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  //std::cout << "ds: " << ds << '\n';
-  //std::cout << "db: " << db << '\n';
 
   if (dX.defined()) {
     at::Tensor c1 = at::empty({0}, X.options().dtype(kAccType));
@@ -881,7 +984,7 @@ void GroupNormBackwardKernelImplInternal(
     num_threads = (C / G) < at::native::cuda_utils::kCUDABlockReduceNumThreads
         ? warp_size
         : at::native::cuda_utils::kCUDABlockReduceNumThreads;
-    ComputeBackwardFusedParamsCUDAKernelF<T>
+    ComputeBackwardFusedParamsCUDAKernel<T>
         <<<dim3(N, G), num_threads, 0, cuda_stream>>>(
             C,
             HxW,
@@ -895,38 +998,98 @@ void GroupNormBackwardKernelImplInternal(
             c3_data);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+    at::MemoryFormat x_format = X.suggest_memory_format();
+
     if (gamma.defined()) {
-      auto iter = at::TensorIteratorConfig()
-                      .check_all_same_dtype(std::is_same<T, T_ACC>::value)
-                      .resize_outputs(false)
-                      .add_owned_output(dX.view({N * G, D, HxW}))
-                      .add_owned_input(dY.view({N * G, D, HxW}))
-                      .add_owned_input(X.view({N * G, D, HxW}))
-                      .add_owned_input(c1.view({N * G, D, 1}))
-                      .add_owned_input(c2.view({N * G, 1, 1}))
-                      .add_owned_input(c3.view({N * G, 1, 1}))
-                      .build();
-      at::native::gpu_kernel(
-          iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
-            return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
-                c3;
-          });
+      switch (x_format) {
+        case at::MemoryFormat::Contiguous: {
+          auto iter = at::TensorIteratorConfig()
+                          .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                          .resize_outputs(false)
+                          .add_owned_output(dX.view({N * G, D, HxW}))
+                          .add_owned_input(dY.view({N * G, D, HxW}))
+                          .add_owned_input(X.view({N * G, D, HxW}))
+                          .add_owned_input(c1.view({N * G, D, 1}))
+                          .add_owned_input(c2.view({N * G, 1, 1}))
+                          .add_owned_input(c3.view({N * G, 1, 1}))
+                          .build();
+          at::native::gpu_kernel(
+              iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
+                return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
+                    c3;
+              });
+          break;
+        }
+        case at::MemoryFormat::ChannelsLast: {
+          at::Tensor dX_permuted = dX.permute({0, 2, 3, 1}); // N, C, H, W -> N, H, W, C
+          at::Tensor dY_permuted = dY.permute({0, 2, 3, 1});
+          at::Tensor X_permuted = X.permute({0, 2, 3, 1});
+          auto iter = at::TensorIteratorConfig()
+                          .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                          .resize_outputs(false)
+                          .add_owned_output(dX_permuted.view({N, HxW, G, D}))
+                          .add_owned_input(dY_permuted.view({N, HxW, G, D}))
+                          .add_owned_input(X_permuted.view({N, HxW, G, D}))
+                          .add_owned_input(c1.view({N, 1, G, D}))
+                          .add_owned_input(c2.view({N, 1, G, 1}))
+                          .add_owned_input(c3.view({N, 1, G, 1}))
+                          .build();
+          at::native::gpu_kernel(
+              iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
+                return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
+                    c3;
+              });
+          break;
+        }
+        default: {
+           break;
+        }
+      }
     } else {
-      auto iter = at::TensorIteratorConfig()
-                      .check_all_same_dtype(std::is_same<T, T_ACC>::value)
-                      .resize_outputs(false)
-                      .add_owned_output(dX.view({N * G, D * HxW}))
-                      .add_owned_input(dY.view({N * G, D * HxW}))
-                      .add_owned_input(X.view({N * G, D * HxW}))
-                      .add_owned_input(rstd.view({N * G, 1}))
-                      .add_owned_input(c2.view({N * G, 1}))
-                      .add_owned_input(c3.view({N * G, 1}))
-                      .build();
-      at::native::gpu_kernel(
-          iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
-            return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
-                c3;
-          });
+      switch (x_format) {
+        case at::MemoryFormat::Contiguous: {
+          auto iter = at::TensorIteratorConfig()
+                          .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                          .resize_outputs(false)
+                          .add_owned_output(dX.view({N * G, D * HxW}))
+                          .add_owned_input(dY.view({N * G, D * HxW}))
+                          .add_owned_input(X.view({N * G, D * HxW}))
+                          .add_owned_input(rstd.view({N * G, 1}))
+                          .add_owned_input(c2.view({N * G, 1}))
+                          .add_owned_input(c3.view({N * G, 1}))
+                          .build();
+          at::native::gpu_kernel(
+              iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
+                return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
+                    c3;
+              });
+          break;
+        }
+        case at::MemoryFormat::ChannelsLast: {
+          at::Tensor dX_permuted = dX.permute({0, 2, 3, 1}); // N, C, H, W -> N, H, W, C
+          at::Tensor dY_permuted = dY.permute({0, 2, 3, 1});
+          at::Tensor X_permuted = X.permute({0, 2, 3, 1});
+          auto iter = at::TensorIteratorConfig()
+                          .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+                          .resize_outputs(false)
+                          .add_owned_output(dX_permuted.view({N, HxW, G, D}))
+                          .add_owned_input(dY_permuted.view({N, HxW, G, D}))
+                          .add_owned_input(X_permuted.view({N, HxW, G, D}))
+                          .add_owned_input(rstd.view({N, 1, G, 1}))
+                          .add_owned_input(c2.view({N, 1, G, 1}))
+                          .add_owned_input(c3.view({N, 1, G, 1}))
+                          .build();
+          at::native::gpu_kernel(
+              iter, [] GPU_LAMBDA(T dy, T x, T_ACC c1, T_ACC c2, T_ACC c3) -> T {
+                return c1 * static_cast<T_ACC>(dy) + c2 * static_cast<T_ACC>(x) +
+                    c3;
+              });
+          break;
+        }
+        default: {
+          break;
+        }
+      }
     }
   }
   if (dgamma.defined() || dbeta.defined()) {
@@ -935,7 +1098,7 @@ void GroupNormBackwardKernelImplInternal(
     if (N <= 128) {
       // For small batch size, do colwise reduce directly.
       const int64_t B = (C + kCUDANumThreads - 1) / kCUDANumThreads;
-      GammaBetaBackwardCUDAKernelF1<T><<<B, kCUDANumThreads, 0, cuda_stream>>>(
+      GammaBetaBackwardCUDAKernel1<T><<<B, kCUDANumThreads, 0, cuda_stream>>>(
           N,
           C,
           G,
@@ -949,11 +1112,11 @@ void GroupNormBackwardKernelImplInternal(
     } else {
       const int64_t B = (C + kReduceTileSize - 1) / kReduceTileSize;
       // The algorithm for colwise reduction here is to accumulate each 32 cols
-      // to a 32 * 32 tile and write the tile to shared memmory. Then do warp
+      // to a 32 * 32 tile and write the tile to shared memory. Then do warp
       // reduce for each col in the tile. So here the blockDim must be (32, 16).
       constexpr int kThreadX = kReduceTileSize;
       constexpr int kThreadY = kReduceTileSize / 2;
-      GammaBetaBackwardCUDAKernelF2<T>
+      GammaBetaBackwardCUDAKernel2<T>
           <<<B, dim3(kThreadX, kThreadY), 0, cuda_stream>>>(
               N,
               C,

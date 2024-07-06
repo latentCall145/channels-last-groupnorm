@@ -2,8 +2,9 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
-import torch, datetime, time, os, itertools
-torch.set_printoptions(sci_mode=False)
+import torch, datetime, time, os, itertools, sys
+#torch.set_printoptions(sci_mode=False, edgeitems=8, linewidth=160,precision=12)
+torch.set_printoptions(sci_mode=False, edgeitems=1)
 module_dir = os.path.dirname(os.path.abspath(__file__))
 
 from torch.utils.cpp_extension import load
@@ -12,14 +13,17 @@ gn_op = load(
         sources=[
             os.path.join(module_dir, "custom_gn.cpp"),
             os.path.join(module_dir, "gn_kernel.cu"),
-            #os.path.join(module_dir, "nchw_kernel.cu")
+            os.path.join(module_dir, "nchw_kernel.cu")
             ],
         extra_cuda_cflags=[
             '-use_fast_math',
+            '-extra-device-vectorization',
+            '-extended-lambda', # for gpu_kernel (although this isn't used in custom GN kernels)
             '-lineinfo', # useful for profiling
+            '-src-in-ptx',
             ],
         extra_cflags=[
-            '-O3', # needed or else GN NCHW from source is slower than nn.GroupNorm
+            '-Ofast', # needed or else GN NCHW from source is slower than nn.GroupNorm
             '-funroll-all-loops',
             '-march=native',
             ], 
@@ -60,15 +64,8 @@ class GN_NHWC(nn.GroupNorm):
 
     @torch._dynamo.disable
     def forward(self, x):
-        #print(x.shape, self.num_channels)
         N, C, H, W = x.shape
         G = self.num_groups
-
-        #if C // G > 512:
-        #    raise ValueError(f'Error in fwd for X.shape={x.shape}, G={G}: C // G = {C // G} which is greater than 512. This input is not supported.')
-
-        #if H * W % 8 != 0:
-        #    raise ValueError(f'Error in fwd for X.shape={x.shape}, G={G}: H * W is not a multiple of 8. This input is not supported.')
 
         if self.affine:
             return GN_NHWC_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps, self.activation)
@@ -80,16 +77,15 @@ class GN_NHWC(nn.GroupNorm):
 class GN_NCHW_Func(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
-        X_out, means, rstds = gn_op.nchwforward(X, weight, bias, G, eps)
+        X_out, means, rstds = torch.ops.gnop.nchw_fwd(X, weight, bias, G, eps)
         ctx.save_for_backward(X, weight, means, rstds)
         ctx.G = G
         return X_out
 
     @staticmethod
     def backward(ctx, dy):
-        dy = dy.contiguous()
         X, weight, means, rstds = ctx.saved_tensors 
-        dx, dgamma, dbeta = gn_op.nchwbackward(dy, X, weight, means, rstds, ctx.G)
+        dx, dgamma, dbeta = torch.ops.gnop.nchw_bwd(dy, X, weight, means, rstds, ctx.G)
         return dx, dgamma, dbeta, None, None
 
 class GN_NCHW(nn.GroupNorm):
@@ -98,170 +94,249 @@ class GN_NCHW(nn.GroupNorm):
 
     def forward(self, x):
         if self.affine:
-            return GN_NCHW_Func.apply(x.contiguous(), self.weight, self.bias, self.num_groups, self.eps)
+            return GN_NCHW_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
         else:
             w = torch.ones((self.num_channels,), device=x.device, dtype=x.dtype)
             b = torch.zeros((self.num_channels,), device=x.device, dtype=x.dtype)
-            return GN_NCHW_Func.apply(x.contiguous(), w, b, self.num_groups, self.eps)
+            return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
 
-def red(text):
-    return '\033[91m' + str(text) + '\033[0m'
-def green(text):
-    return '\033[92m' + str(text) + '\033[0m'
-def yellow(text):
-    return '\033[93m' + str(text) + '\033[0m'
-def blue(text):
-    return '\033[94m' + str(text) + '\033[0m'
+class GN_Naive(nn.Module):
+    def __init__(self, num_groups: int, nc: int, **kwargs):
+        super().__init__()
+        self.G = num_groups
+        self.C = nc
+        self.eps = 1e-05
+        self.weight = nn.Parameter(torch.ones((nc,)))
+        self.bias = nn.Parameter(torch.zeros((nc,)))
+        self.x = None
+        self.xnorm = None
+        self.means = self.rstds = None
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        self.x = x
+        xr = x.view(N, self.G, H*W*C//self.G)
+        means = xr.mean(dim=2, keepdim=True)
+        rstds = torch.rsqrt(xr.var(dim=2, correction=0, keepdim=True) + self.eps)
+        self.means = means[:, :, 0]
+        self.rstds = rstds[:, :, 0]
+        xnorm = (xr - means) * rstds
+        self.xnorm = xnorm
+        xnormr = xnorm.reshape(N, C, H, W) * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+        return xnormr
+
+    def bwd(self, dy): # bwd pass for debugging
+        N, C, H, W = dy.shape
+        G = self.G
+        D = C // G
+        dyr = dy.view(N, G, D, H, W)
+        xr = x.view(N, G, D, H, W)
+        dy_sum = dyr.sum((3, 4))
+        xdy_sum = (dyr * xr).sum((3, 4))
+        dy_gamma = (self.weight.view(1, G, D) * dy_sum).sum(2)
+        xdy_gamma = (self.weight.view(1, G, D) * xdy_sum).sum(2)
+        dweight = ((xdy_sum - self.means[:,:,None] * dy_sum) * self.rstds[:,:,None]).sum(0)
+        dbias = dy_sum.sum(0)
+        c1 = (self.means * dy_gamma - xdy_gamma) / (H*W*D) * self.rstds**3
+        c2 = -self.means * c1 - dy_gamma*self.rstds / (H*W*D)
+        dx = self.weight.view(1,G,D,1,1)*self.rstds.view(N,G,1,1,1)*dyr + c1.view(N,G,1,1,1)*xr+c2.view(N,G,1,1,1)
+
+def red(text): return '\033[91m' + str(text) + '\033[0m'
+def green(text): return '\033[92m' + str(text) + '\033[0m'
+def yellow(text): return '\033[93m' + str(text) + '\033[0m'
+def blue(text): return '\033[94m' + str(text) + '\033[0m'
 
 def config_filter(x): # returns true if config is valid
     DTYPE, B, C, R, G = x
     if C % G != 0:
         return False
-
-    if R == 1: # this causes an autograd problem where it gets confused since the tensor is both contiguous in channels first/last format 
+    if R == 1: # this causes an autograd problem where it gets confused since the tensor is both contiguous in NCHW/NHWC format 
         return False
 
-    if C / G > 512: # this isn't supported since it is assumed that at least one full group is processed per block in the fwd and the max threads per block is set to 512
-        return False
-
-    dtype_size = 2 if DTYPE in (torch.half, torch.bfloat16) else 4 # only care about 16/32-bit dtypes for now
+    dtype_size = {torch.half: 2, torch.bfloat16: 2, torch.float: 4, torch.double: 8}[DTYPE] # only care about 16/32-bit dtypes for now
     estimated_mem_usage_gib = (25 * dtype_size * B * C * R * R) / 2**30 #  this is just a rough estimate, likely wrong
-    if estimated_mem_usage_gib > 4: # vram filter
+    if estimated_mem_usage_gib > 3: # vram filter
         return False
     return True
 
+bigx = None
+def check_params(params, verbose=False):
+    global bigx
+    if bigx is None:
+        bigx = torch.randn(128*1024*1024)
+    vprint = lambda *args, **kwargs: print(*args, **kwargs) if verbose else None
+    DTYPE, B, C, R, G = params
+    vprint(blue(f'output testing | DTYPE: {DTYPE} |B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3}'))
+    xc = bigx[:B*C*R*R].reshape((B, C, R, R)).to(DTYPE).cuda()
+    x = xc.to(memory_format=torch.channels_last)
+    xc.requires_grad_(True)
+    x.requires_grad_(True)
+    torch.random.manual_seed(0)
+
+    gn2 = GN_NHWC(G, C, activation=ACT_FN).cuda().to(DTYPE)
+
+    if CHECK_PROF:
+        gn2(x).sum().backward()
+        gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
+        gn1(x.contiguous()).sum().backward()
+    else:
+        gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
+        gnref = GN_Naive(G, C).cuda().to(DTYPE)
+        with torch.no_grad():
+            w = torch.randn((C,), dtype=DTYPE)
+            b = torch.randn((C,), dtype=DTYPE)
+            gn1.weight.copy_(w.detach().float())
+            gn1.bias.copy_(b.detach().float())
+            gn2.weight.copy_(w.detach())
+            gn2.bias.copy_(b.detach())
+            gnref.weight.copy_(w.detach())
+            gnref.bias.copy_(b.detach())
+
+        gn_layers = [gn1, gn2, gnref]
+        g1 = act_fn(gn1(xc))
+        g2 = gn2(x)
+        rand_dy = torch.rand_like(g2)
+        rand_dy /= rand_dy.numel() ** 0.5 # to prevent false positive errors from ocurring because of really large magnitude losses
+
+        ERRS = {
+            torch.bfloat16: 1e-6,
+            torch.float16: 1e-7,
+            torch.float: 1e-10,
+            torch.double: 1e-20,
+        }
+
+        err_params = False
+        gref = gref_dx = None
+        def vprint_err(x_ref, x_test, x_naive_fn, bwd=True, left_pad=0):
+            nonlocal gref, gref_dx
+            lpad = ' ' * left_pad
+            with torch.no_grad():
+                err = F.mse_loss(x_ref, x_test)
+
+            if err < ERRS[DTYPE]:
+                vprint(green(f'{lpad}Negligible difference (err: {err:.2e}) found'))
+            else:
+                if gref is None:
+                    gref = act_fn(gnref(xc))
+                if bwd and gref_dx is None:
+                    xc.grad = None
+                    (gref * rand_dy).sum().backward()
+                    gref_dx = xc.grad.clone()
+
+                with torch.no_grad():
+                    x_naive = x_naive_fn()
+                    err_ref_naive = F.mse_loss(x_ref, x_naive)
+                    err_test_naive = F.mse_loss(x_test, x_naive)
+
+                if err_test_naive < err_ref_naive:
+                    vprint(yellow(f'{lpad}Negligible difference (err: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}) found'))
+                else:
+                    vprint(red(f'{lpad}Error: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}'))
+                    return True
+            return False
+
+        vprint('  FORWARD')
+        err_params = vprint_err(g1, g2, lambda: gref, bwd=False, left_pad=4) or err_params
+        vprint('  BACKWARD')
+        xc.grad = None
+        (g1 * rand_dy).sum().backward()
+        g1_dx = xc.grad.clone()
+
+        x.grad = None
+        (g2 * rand_dy).sum().backward()
+        g2_dx = x.grad.clone()
+
+        vprint('    wrt X')
+        err_params = vprint_err(g1_dx, g2_dx, lambda: gref_dx, left_pad=6) or err_params
+        vprint('    wrt weight')
+        err_params = vprint_err(gn1.weight.grad, gn2.weight.grad, lambda: gnref.weight.grad, left_pad=6) or err_params
+        vprint('    wrt bias')
+        err_params = vprint_err(gn1.bias.grad, gn2.bias.grad, lambda: gnref.bias.grad, left_pad=6) or err_params
+
+        return err_params
+
 if __name__ == '__main__':
-    ACT_FN = 'silu'
-    if ACT_FN == 'silu':
-        act_fn = F.silu
-    if ACT_FN == 'identity':
-        act_fn = lambda x: x
-    if ACT_FN == 'relu':
-        act_fn = F.relu
-    if ACT_FN == 'gelu':
-        act_fn = F.gelu
-    if ACT_FN == 'gelu_tanh':
-        act_fn = lambda x: F.gelu(x, approximate='tanh')
+    ACT_FN = 'identity'
+    act_fn = {
+        'identity': lambda x: x,
+        'silu': F.silu,
+        'relu': F.relu,
+        'gelu': F.gelu,
+        'gelu_tanh': lambda x: F.gelu(x, approximate='tanh'),
+    }[ACT_FN]
+
     MODE = 'check' # can be 'check', 'bench', other modes do both
-    CHECK_PROF = False
+    CHECK_PROF = len(sys.argv) > 1 and sys.argv[1] == '1'
 
     if MODE != 'bench':
-        #DTYPEs = (torch.bfloat16, torch.float, torch.double)
-        DTYPEs = (torch.bfloat16,)
         Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
         Cs = (
-                32, 64, 128, 256, 512,
-                13, 140, 125, 961,
-                160, 320, 640, 960, 1280, 1600, 1920, 2240, 2560
-                )
+            1, 2, 3, 4, 5, 6, 7, 32, 64, 128, 256, 512,
+            13, 140, 125, 961,
+            160, 320, 640, 960, 1280, 1600, 1920, 2240, 2560, 1303, 2602, 3909
+        )
         Rs = (
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 17,
-                8, 16, 64, 128, 256, 512,
-                1024,
-                )
-        Gs = (1, 2, 4, 8, 16, 32,)
-        all_params = itertools.product(DTYPEs, Bs, Cs, Rs, Gs)
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 17,
+            8, 16, 64, 128, 256, 512,
+            1024,
+        )
+        Gs = (1, 2, 3, 4, 8, 16, 32,)
+        all_params = itertools.product([torch.float], Bs, Cs, Rs, Gs)
 
-        err_inputs = []
-        for params in tqdm(sorted(
-                #filter(config_filter, all_params),
-                [
-                    (torch.bfloat16, 2, 1280, 8, 32),
-                    (torch.bfloat16, 2, 640, 16, 32),
-                    (torch.bfloat16, 2, 2560, 8, 32),
-                    (torch.bfloat16, 2, 1280, 16, 32),
-                    (torch.bfloat16, 2, 320, 32, 32),
-                    (torch.bfloat16, 2, 1920, 16, 32),
-                    (torch.bfloat16, 2, 2560, 16, 32),
-                    (torch.bfloat16, 2, 640, 32, 32),
-                    (torch.bfloat16, 2, 960, 32, 32),
-                    (torch.bfloat16, 2, 1280, 32, 32),
-                    (torch.bfloat16, 2, 320, 64, 32),
-                    (torch.bfloat16, 2, 1920, 32, 32),
-                    (torch.bfloat16, 2, 640, 64, 32),
-                    (torch.bfloat16, 2, 960, 64, 32),
-                ],
-                key = lambda x: x[1]*x[2]*x[3]*x[4]
-        )):
-            DTYPE, B, C, R, G = params
-            #torch.cuda.empty_cache()
-            print(f'B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3} | DTYPE: {DTYPE}')
-            x = torch.randn(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 1000
-            #x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True)/R/R/C/B-0.5 #* 1000
-            torch.random.manual_seed(0)
+        inputs = [
+            #(torch.double, 1, 1, 2, 1),
 
-            gn2 = GN_NHWC(G, C, activation=ACT_FN).cuda().to(DTYPE)
+            #(torch.double, 2, 3909, 5, 3),
+            #(torch.double, 1, 2062, 5, 1031),
+            #(torch.double, 3, 4096, 7, 4),
+            #(torch.double, 1, 4096, 7, 4),
 
-            if CHECK_PROF:
-                #g1 = gn1(x.contiguous())
-                #g1sum = g1.sum()
-                #g1_grad_wrt_w = torch.autograd.grad(g1sum, gn1.weight, retain_graph=True)[0]
-                g2 = gn2(x)
-                #g2sum = g2.sum()
-                #g2_grad_wrt_w = torch.autograd.grad(g2sum, gn2.weight, retain_graph=True)[0]
-            else:
-                gn1 = nn.GroupNorm(G, C).float().cuda()
-                gn3 = nn.GroupNorm(G, C).cuda().to(DTYPE)
-                with torch.no_grad():
-                    w = torch.randn((C,), dtype=DTYPE)
-                    b = torch.randn((C,), dtype=DTYPE)
-                    gn1.weight.copy_(w.detach().float())
-                    gn1.bias.copy_(b.detach().float())
-                    gn2.weight.copy_(w.detach())
-                    gn2.bias.copy_(b.detach())
-                    gn3.weight.copy_(w.detach())
-                    gn3.bias.copy_(b.detach())
+            #(torch.double, 2, 160, 8, 160),
+            #(torch.double, 1, 3, 7, 1),
+            #(torch.double, 1, 1, 4, 1),
+            #(torch.double, 1, 128, 8, 8),
+            #(torch.double, 2, 1280, 8, 32),
+            #(torch.double, 2, 640, 16, 32),
+            #(torch.double, 2, 2560, 8, 32),
+            #(torch.double, 2, 1280, 16, 32),
+            #(torch.double, 2, 320, 32, 32),
+            #(torch.double, 2, 1920, 16, 32),
+            #(torch.double, 2, 2560, 16, 32),
+            #(torch.double, 2, 640, 32, 32),
+            #(torch.double, 2, 960, 32, 32),
+            #(torch.double, 2, 1280, 32, 32),
+            #(torch.double, 2, 320, 64, 32),
+            #(torch.double, 2, 1920, 32, 32),
+            #(torch.double, 2, 640, 64, 32),
+            #(torch.float, 1, 64, 256, 32),
+            #(torch.float, 2, 64, 512, 32),
+            (torch.double, 8, 128, 64, 32),
+        ]
+        inputs = None
 
-                g1 = act_fn(gn1(x.float()))
-                g2 = gn2(x)
-                g3 = act_fn(gn3(x))
-                rand_dy = torch.rand_like(g3)
-                rand_dy /= rand_dy.numel() ** 0.5 # to prevent false positive errors from ocurring because of really large magnitude losses
-                g1sum = (g1 * rand_dy).sum()
-                g2sum = (g2 * rand_dy).sum()
-                g3sum = (g3 * rand_dy).sum()
-                def print_err(act_float, act_testing, act_ref, left_pad=0):
-                    with torch.no_grad():
-                        lpad = ' ' * left_pad
-                        red_error = red('ERROR: ')
-                        testing_err = F.mse_loss(act_float, act_testing)
-                        expected_err = F.mse_loss(act_float, act_ref)
-                        if testing_err.isnan() or testing_err / expected_err > 2 and testing_err > 1e-6:
-                            print(red(f'{lpad}Your error: {testing_err}, expected error: {expected_err}'))
-                            err_inputs.append((params, testing_err, expected_err))
-                        else:
-                            print(f'{lpad}Negligible difference (testing err: {testing_err:.2e}, ref err: {expected_err:.2e}) found')
+        err_inputs = filter(config_filter, all_params)
 
-                print('  FORWARD')
-                print_err(g1, g2, g3, 4)
-                print('  BACKWARD')
-                print('    wrt weight')
-                g1_grad_wrt_w = torch.autograd.grad(
-                        g1sum, gn1.weight, retain_graph=True)[0]
-                g2_grad_wrt_w = torch.autograd.grad(
-                        g2sum, gn2.weight, retain_graph=True)[0]
-                g3_grad_wrt_w = torch.autograd.grad(
-                        g3sum, gn3.weight, retain_graph=True)[0]
-                print_err(g1_grad_wrt_w, g2_grad_wrt_w, g3_grad_wrt_w, 6)
+        if inputs is None: # run on cartesian product of inputs
+            for DTYPE in [torch.float, torch.double]: # run tests on low-precision dtypes and rerunning failing tests on higher-precision dtypes to see if there's an actual problem in the code or just a precision error
+                inputs = [(DTYPE, *params[1:]) for params in err_inputs]
+                err_inputs = []
+                for params in tqdm(sorted(
+                    inputs,
+                    key = lambda x: x[1]*x[2]*x[3]*x[4]
+                )):
+                    err_params = check_params(params)
+                    if err_params:
+                        err_inputs.append(params)
+        else:
+            err_inputs = []
+            for params in tqdm(inputs):
+                err_params = check_params(params)
+                if err_params:
+                    err_inputs.append(params)
 
-
-                print('    wrt bias')
-                g1_grad_wrt_b = torch.autograd.grad(
-                        g1sum, gn1.bias, retain_graph=True)[0]
-                g2_grad_wrt_b = torch.autograd.grad(
-                        g2sum, gn2.bias, retain_graph=True)[0]
-                g3_grad_wrt_b = torch.autograd.grad(
-                        g3sum, gn3.bias, retain_graph=True)[0]
-                print_err(g1_grad_wrt_b, g2_grad_wrt_b, g3_grad_wrt_b, 6)
-
-                print('    wrt X')
-                g1_grad_wrt_x = torch.autograd.grad(g1sum, x, retain_graph=True)[0]
-                g2_grad_wrt_x = torch.autograd.grad(g2sum, x, retain_graph=True)[0]
-                g3_grad_wrt_x = torch.autograd.grad(g3sum, x, retain_graph=True)[0]
-                print_err(g1_grad_wrt_x, g2_grad_wrt_x, g3_grad_wrt_x, 6)
         if len(err_inputs) > 0:
             print(red('Error inputs found:'))
-            print('\n'.join(map(lambda x: f'{x[0]}, testing error: {x[1]:.2e}, expected error: {x[2]:.2e}', err_inputs)))
+            print(err_inputs)
         elif not CHECK_PROF:
             print(green('No errors found :)'))
 
@@ -269,21 +344,20 @@ if __name__ == '__main__':
         NSEC = 1 # number of seconds that each kernel runs for on a certain input
         DTYPES = [torch.bfloat16]
         BATCHES = [1, 2, 4, 8, 16, 32]
-        #CHANNELS = [32, 64, 128, 256, 512]
-        CHANNELS = [320, 640, 960, 1920, 2560]
+        CHANNELS = [32, 64, 128]
         RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
-        #NUM_GROUPS = [4, 8, 16, 32, 64, 128]
         NUM_GROUPS = [32]
-        BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
+
+        BATCHES = [1, 8]
+        CHANNELS = [32, 128]
+        RESOLUTIONS = [64, 512]
+        NUM_GROUPS = [32]
+
+        BENCH = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
         GN_KERNELS = [
-                #(GN_NHWC, 'GN NHWC fused (custom op)', gn_op.fwd_fused),
-                #(GN_NHWC, 'GN NHWC NH grid (custom op)', gn_op.fwd_NH_grid),
-                #(GN_NHWC, 'GN NHWC N grid (custom op)', gn_op.fwd_N_grid),
-                #(GN_NHWC, 'GN NHWC NG grid NG grid (custom op)', gn_op.fwd_NG_grid),
-                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', gn_op.nchwforward),
-                (nn.GroupNorm, 'torch.nn GN NCHW', None),
-                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)', None),
-                (GN_NHWC, 'GN NHWC', None),
+                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)'),
+                (nn.GroupNorm, 'torch.nn GN NCHW'),
+                (GN_NHWC, 'GN NHWC'),
         ]
 
         os.makedirs('csvs', exist_ok=True)
@@ -296,43 +370,42 @@ if __name__ == '__main__':
         print('Estimated time (seconds) to complete:', NSEC * len(configs) * len(GN_KERNELS))
 
         for DTYPE, B, C, R, G in configs:
-            x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
-            x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
+            x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda', requires_grad=True)
+            x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).detach().requires_grad_(True)
 
             gn_args = (G, C)
-            print(BENCH, 'X shape:', x_nchw.shape, 'G (num groups):', G)
-            for gn_class, desc, fwd_fn in GN_KERNELS:
+            print(blue(f'benchmark ({BENCH}) | DTYPE: {DTYPE} | B: {B} | C: {C} | R: {R} | G: {G}'))
+            for gn_class, desc in GN_KERNELS:
                 gn_input = x_nchw if 'NCHW' in desc else x_nhwc
                 print(f'\t{desc}')
 
                 try:
-                    gn_layer = gn_class(*gn_args).cuda().to(DTYPE)
-                    g = gn_layer(gn_input)
-                    if not isinstance(gn_layer, GN_NHWC):
-                        g = act_fn(g)
+                    gn_layer = gn_class(*gn_args).to(DTYPE).cuda()
 
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        g = gn_layer(gn_input)
+                        if not isinstance(gn_layer, GN_NHWC):
+                            g = act_fn(g)
+                        if BENCH != 'fwd':
+                            g.sum().backward()
                     torch.cuda.synchronize()
 
                     tic = time.time()
                     tic_sec = time.time()
-                    ntrials = 0
-                    ntrials_minor = 0
+                    ntrials = ntrials_minor = 0
                     minor_speeds = [] # used to track speed percentiles since they can often vary by a lot
 
                     while time.time() - tic < NSEC:
-                        if BENCH == 'fwd':
-                            if fwd_fn is None:
-                                g = gn_layer(gn_input)
-                            else:
-                                g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps) # Not calling gn_layer(gn_input) since I found this added a lot of overhead
-                        elif BENCH == 'both':
-                            g = gn_layer(gn_input)
-                        if not isinstance(gn_layer, GN_NHWC):
-                            g = act_fn(g)
-                        if BENCH != 'fwd':
-                            torch.autograd.grad(g.sum(), gn_input, retain_graph=True)
-                        torch.cuda.synchronize()
+                        graph.replay()
 
+                        #g = gn_layer(gn_input)
+                        #if not isinstance(gn_layer, GN_NHWC):
+                        #    g = act_fn(g)
+                        #if BENCH != 'fwd':
+                        #    g.sum().backward()
+
+                        torch.cuda.synchronize()
                         ntrials += 1
                         ntrials_minor += 1
 
@@ -354,6 +427,7 @@ if __name__ == '__main__':
                     raise
                 except Exception as e:
                     print('\t\tFAILED; Error:', str(e).strip())
+                    raise
                     median_speed = slow_speed = fast_speed = '-1 (failed)'
                 
                 outfile.write(f'{desc},{B},{C},{R},{G},{C//G},{slow_speed},{median_speed},{fast_speed}\n')
