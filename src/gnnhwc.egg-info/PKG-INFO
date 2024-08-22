@@ -23,23 +23,11 @@ Finally, by fusing the activation with the GN kernel, further speedups and memor
 ## Use
 Just a drop-in replacement for torch.nn.GroupNorm (except the activation keyword, which allows the GN forward/backward to run using a fused activation)
 
+`pip install git+https://github.com/latentCall145/channels-last-groupnorm.git`
+
 Code:
 ```python
-'''
-if your directory structure is like:
-gnNHWC
-├── custom_gn.py
-└── (your files here)
-'''
-from custom_gn import GN_NHWC # if running from within the gnNHWC folder
-
-'''
-if your directory structure is like:
-my_project
-├── gnNHWC
-└── (your files here)
-'''
-from gnNHWC.custom_gn import GN_NHWC # if running from outside the gnNHWC folder
+from gnnhwc import GN_NHWC
 
 GN_NHWC(32, 128, activation='identity') # replaces nn.GroupNorm(32, 128)
 GN_NHWC(32, 128, activation='relu') # replaces nn.GroupNorm(32, 128) and nn.ReLU()

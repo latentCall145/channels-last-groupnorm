@@ -8,7 +8,7 @@
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define CDIV(a, b) ((a) + (b) - 1) / (b)
 
-#define DEBUG_ENABLED 1
+#define DEBUG_ENABLED 0
 #if DEBUG_ENABLED
 #include <iostream>
 #define DEBUG(format, args...) fprintf(stderr, format, args); std::cout << std::flush;
