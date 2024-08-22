@@ -1,9 +1,0 @@
-LICENSE
-README.md
-pyproject.toml
-src/gnnhwc/__init__.py
-src/gnnhwc/custom_gn.py
-src/gnnhwc.egg-info/PKG-INFO
-src/gnnhwc.egg-info/SOURCES.txt
-src/gnnhwc.egg-info/dependency_links.txt
-src/gnnhwc.egg-info/top_level.txt
