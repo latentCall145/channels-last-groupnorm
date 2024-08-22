@@ -3,102 +3,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 import torch, datetime, time, os, itertools, sys
-#torch.set_printoptions(sci_mode=False, edgeitems=8, linewidth=160,precision=12)
 torch.set_printoptions(sci_mode=False, edgeitems=1)
-module_dir = os.path.dirname(os.path.abspath(__file__))
-
-from torch.utils.cpp_extension import load
-gn_op = load(
-        name="gn_op",
-        sources=[
-            os.path.join(module_dir, "custom_gn.cpp"),
-            os.path.join(module_dir, "gn_kernel.cu"),
-            os.path.join(module_dir, "nchw_kernel.cu")
-            ],
-        extra_cuda_cflags=[
-            '-use_fast_math',
-            '-extra-device-vectorization',
-            '-extended-lambda', # for gpu_kernel (although this isn't used in custom GN kernels)
-            '-lineinfo', # useful for profiling
-            '-src-in-ptx',
-            ],
-        extra_cflags=[
-            '-Ofast', # needed or else GN NCHW from source is slower than nn.GroupNorm
-            '-funroll-all-loops',
-            '-march=native',
-            ], 
-        is_python_module=False,
-        verbose=True,
-        )
-
-class GN_NHWC_Func(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float, activation: str):
-        X_out, means, rstds = torch.ops.gnop.fwd(X, weight, bias, G, eps, activation)
-        ctx.save_for_backward(X, weight, bias, means, rstds)
-        ctx.G = G
-        ctx.activation = activation
-        return X_out
-
-    @staticmethod
-    def backward(ctx, dy: torch.Tensor):
-        dy = dy.contiguous(memory_format=torch.channels_last)
-        X, weight, bias, means, rstds = ctx.saved_tensors 
-        dx, dgamma, dbeta = torch.ops.gnop.bwd(dy, X, weight, bias, means, rstds, ctx.G, ctx.activation)
-        return dx, dgamma, dbeta, None, None, None
-
-class GN_NHWC(nn.GroupNorm):
-    def __init__(self, num_groups: int, nc: int, activation='identity', **kwargs):
-        super().__init__(num_groups, nc, **kwargs)
-        assert activation in {'identity', 'silu', 'relu', 'gelu', 'gelu_tanh'}
-        if activation == 'identity':
-            self.activation = 0
-        if activation == 'relu':
-            self.activation = 1
-        if activation == 'silu':
-            self.activation = 2
-        if activation == 'gelu':
-            self.activation = 3
-        if activation == 'gelu_tanh':
-            self.activation = 4
-
-    @torch._dynamo.disable
-    def forward(self, x):
-        N, C, H, W = x.shape
-        G = self.num_groups
-
-        if self.affine:
-            return GN_NHWC_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps, self.activation)
-        else:
-            w = torch.ones((self.num_channels,), device=x.device, dtype=x.dtype)
-            b = torch.zeros((self.num_channels,), device=x.device, dtype=x.dtype)
-            return GN_NHWC_Func.apply(x, w, b, self.num_groups, self.eps, self.activation)
-
-class GN_NCHW_Func(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
-        X_out, means, rstds = torch.ops.gnop.nchw_fwd(X, weight, bias, G, eps)
-        ctx.save_for_backward(X, weight, means, rstds)
-        ctx.G = G
-        return X_out
-
-    @staticmethod
-    def backward(ctx, dy):
-        X, weight, means, rstds = ctx.saved_tensors 
-        dx, dgamma, dbeta = torch.ops.gnop.nchw_bwd(dy, X, weight, means, rstds, ctx.G)
-        return dx, dgamma, dbeta, None, None
-
-class GN_NCHW(nn.GroupNorm):
-    def __init__(self, num_groups: int, nc: int, **kwargs):
-        super().__init__(num_groups, nc, **kwargs)
-
-    def forward(self, x):
-        if self.affine:
-            return GN_NCHW_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
-        else:
-            w = torch.ones((self.num_channels,), device=x.device, dtype=x.dtype)
-            b = torch.zeros((self.num_channels,), device=x.device, dtype=x.dtype)
-            return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
 
 class GN_Naive(nn.Module):
     def __init__(self, num_groups: int, nc: int, **kwargs):
@@ -154,13 +59,14 @@ def config_filter(x): # returns true if config is valid
         return False
 
     dtype_size = {torch.half: 2, torch.bfloat16: 2, torch.float: 4, torch.double: 8}[DTYPE] # only care about 16/32-bit dtypes for now
-    estimated_mem_usage_gib = (25 * dtype_size * B * C * R * R) / 2**30 #  this is just a rough estimate, likely wrong
+    #estimated_mem_usage_gib = (25 * dtype_size * B * C * R * R) / 2**30 #  this is just a rough estimate, likely wrong
+    estimated_mem_usage_gib = (5 * dtype_size * B * C * R * R) / 2**30 #  this is just a rough estimate, likely wrong
     if estimated_mem_usage_gib > 3: # vram filter
         return False
     return True
 
 bigx = None
-def check_params(params, verbose=False):
+def check_params(params, verbose=True):
     global bigx
     if bigx is None:
         bigx = torch.randn(128*1024*1024)
@@ -256,7 +162,7 @@ def check_params(params, verbose=False):
         return err_params
 
 if __name__ == '__main__':
-    ACT_FN = 'identity'
+    ACT_FN = 'silu'
     act_fn = {
         'identity': lambda x: x,
         'silu': F.silu,
@@ -343,17 +249,17 @@ if __name__ == '__main__':
     if MODE != 'check':
         NSEC = 1 # number of seconds that each kernel runs for on a certain input
         DTYPES = [torch.bfloat16]
-        BATCHES = [1, 2, 4, 8, 16, 32]
-        CHANNELS = [32, 64, 128]
-        RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
-        NUM_GROUPS = [32]
+        #BATCHES = [1, 2, 4, 8, 16, 32]
+        #CHANNELS = [32, 64, 128]
+        #RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
+        #NUM_GROUPS = [32]
 
         BATCHES = [1, 8]
         CHANNELS = [32, 128]
         RESOLUTIONS = [64, 512]
         NUM_GROUPS = [32]
 
-        BENCH = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
+        BENCH = 'bwd' # can be 'fwd', anything else is fwd + bwd
         GN_KERNELS = [
                 #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)'),
                 (nn.GroupNorm, 'torch.nn GN NCHW'),
@@ -377,6 +283,7 @@ if __name__ == '__main__':
             print(blue(f'benchmark ({BENCH}) | DTYPE: {DTYPE} | B: {B} | C: {C} | R: {R} | G: {G}'))
             for gn_class, desc in GN_KERNELS:
                 gn_input = x_nchw if 'NCHW' in desc else x_nhwc
+                grad = torch.ones_like(gn_input)
                 print(f'\t{desc}')
 
                 try:
@@ -388,7 +295,7 @@ if __name__ == '__main__':
                         if not isinstance(gn_layer, GN_NHWC):
                             g = act_fn(g)
                         if BENCH != 'fwd':
-                            g.sum().backward()
+                            g.backward(grad)
                     torch.cuda.synchronize()
 
                     tic = time.time()
@@ -412,7 +319,10 @@ if __name__ == '__main__':
                         if time.time() - tic_sec > 0.1:
                             speed = round(ntrials_minor / (time.time() - tic_sec), 2)
                             minor_speeds.append(speed)
-                            print(f'\t\t{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {blue(speed)} it/s\r', end='')
+
+                            bw = gn_input.numel() * (3 if BENCH == 'fwd' else 3+5) * {torch.half:2,torch.bfloat16:2, torch.float:4,torch.double:8}[DTYPE]
+                            print(f'\t\tBandwidth (GB/s): {ntrials * bw / (time.time() - tic) / 1e9:.2f}, duration: {time.time() - tic:.1f}/{NSEC} seconds completed, speed: {blue(speed)} it/s           \r', end='')
+                            #print(f'\t\t{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {blue(speed)} it/s\r', end='')
                             ntrials_minor = 0
                             tic_sec = time.time()
 
@@ -434,3 +344,4 @@ if __name__ == '__main__':
             print()
         print(f'All tests done, closing {fname}.')
         outfile.close()
+

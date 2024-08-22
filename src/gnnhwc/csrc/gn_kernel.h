@@ -42,31 +42,31 @@ void run_gn_bwd_kernels(
       T *dweight_data,
       T *dbias_data);
 
-void GroupNormKernelImpl(
-    const at::Tensor& X,
-    const at::Tensor& gamma,
-    const at::Tensor& beta,
-    int64_t N,
-    int64_t C,
-    int64_t HxW,
-    int64_t group,
-    double eps,
-    at::Tensor& Y,
-    at::Tensor& mean,
-    at::Tensor& rstd);
-
-void GroupNormBackwardKernelImpl(
-    const at::Tensor& dY,
-    const at::Tensor& X,
-    const at::Tensor& mean,
-    const at::Tensor& rstd,
-    const at::Tensor& gamma,
-    int64_t N,
-    int64_t C,
-    int64_t HxW,
-    int64_t group,
-    at::Tensor& dX,
-    at::Tensor& dgamma,
-    at::Tensor& dbeta);
+//void GroupNormKernelImpl(
+//    const at::Tensor& X,
+//    const at::Tensor& gamma,
+//    const at::Tensor& beta,
+//    int64_t N,
+//    int64_t C,
+//    int64_t HxW,
+//    int64_t group,
+//    double eps,
+//    at::Tensor& Y,
+//    at::Tensor& mean,
+//    at::Tensor& rstd);
+//
+//void GroupNormBackwardKernelImpl(
+//    const at::Tensor& dY,
+//    const at::Tensor& X,
+//    const at::Tensor& mean,
+//    const at::Tensor& rstd,
+//    const at::Tensor& gamma,
+//    int64_t N,
+//    int64_t C,
+//    int64_t HxW,
+//    int64_t group,
+//    at::Tensor& dX,
+//    at::Tensor& dgamma,
+//    at::Tensor& dbeta);
 
 #endif

@@ -1,3 +1,17 @@
+Metadata-Version: 2.1
+Name: gnnhwc
+Version: 0.0.1
+Summary: Channels last group normalization in Pytorch
+Author-email: Thaihoa Nguyen <tonanhhoaduc@gmail.com>
+Project-URL: Homepage, https://github.com/latentCall145/channels-last-groupnorm
+Project-URL: Issues, https://github.com/latentCall145/channels-last-groupnorm/issues
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+
 # gnNHWC
 A highly optimized CUDA kernel for channels last (NHWC) group normalization in PyTorch.
 
@@ -9,11 +23,23 @@ Finally, by fusing the activation with the GN kernel, further speedups and memor
 ## Use
 Just a drop-in replacement for torch.nn.GroupNorm (except the activation keyword, which allows the GN forward/backward to run using a fused activation)
 
-`pip install git+https://github.com/latentCall145/channels-last-groupnorm.git`
-
 Code:
 ```python
-from gnnhwc import GN_NHWC
+'''
+if your directory structure is like:
+gnNHWC
+├── custom_gn.py
+└── (your files here)
+'''
+from custom_gn import GN_NHWC # if running from within the gnNHWC folder
+
+'''
+if your directory structure is like:
+my_project
+├── gnNHWC
+└── (your files here)
+'''
+from gnNHWC.custom_gn import GN_NHWC # if running from outside the gnNHWC folder
 
 GN_NHWC(32, 128, activation='identity') # replaces nn.GroupNorm(32, 128)
 GN_NHWC(32, 128, activation='relu') # replaces nn.GroupNorm(32, 128) and nn.ReLU()

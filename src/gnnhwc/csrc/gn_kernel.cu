@@ -8,7 +8,7 @@
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define CDIV(a, b) ((a) + (b) - 1) / (b)
 
-#define DEBUG_ENABLED 0
+#define DEBUG_ENABLED 1
 #if DEBUG_ENABLED
 #include <iostream>
 #define DEBUG(format, args...) fprintf(stderr, format, args); std::cout << std::flush;
@@ -121,7 +121,7 @@ next_pow2(unsigned int x) {
 template <typename T>
 __global__ void
 compute_stats_pt1(
-    const T* X,
+    const T *X,
     const int H,
     const int W,
     const int C,
@@ -219,8 +219,8 @@ compute_stats_pt2(
     const int R,
     const int G,
     const T eps,
-    T* means,
-    T* rstds) {
+    T *means,
+    T *rstds) {
   using T_ACC = typename acc_type<T>::type;
   using WelfordType = WelfordData<T_ACC, INT>;
   using WelfordOp = WelfordOps<T_ACC, T_ACC, INT, thrust::pair<T_ACC, T_ACC>>;
@@ -251,6 +251,7 @@ compute_stats_pt2(
     idx += r;
     val = welford_op.combine(val, welford_data[idx]);
   }
+  //printf("gn_kernel 254 n: %d, nf: %f\n", val.n, val.nf);
 
   // shmem reduction
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[MAX_THREADS_PER_BLOCK];
@@ -281,18 +282,19 @@ compute_stats_pt2(
 template <typename T, int vec_elems>
 __global__ void
 scale_shift(
-    const T* X_data,
-    const T* mean_data,
-    const T* rstd_data,
-    const T* weight_data,
-    const T* bias_data,
+    const T *X_data,
+    const T *mean_data,
+    const T *rstd_data,
+    const T *weight_data,
+    const T *bias_data,
+    const int N,
     const int H,
     const int W,
     const int C,
     const int G,
     const int LOOP_I,
     const int act_fn_option,
-    T* y) {
+    T *y) {
   /*
     Performs elementwise op (X - mean) * rstd * weight + bias. Vectorized for speed.
     LOOP_I: number of elements that each thread processes.
@@ -300,6 +302,7 @@ scale_shift(
     grid: (x=N, y=HW/LOOP_I/d, z=f), block: (x=TPB/d, y=d)
     - C' = C / vec_elems
     - f = cdiv(C', TPB) (e.g. f*TPB ~ C')
+    - note: the grid is actually (x=NHW/LOOP_I/d, y=1, z=f) since y/z max block size is 65K which causes issues for N=1, H=W=1024, C=256
     if d > 1:
       X shape: (N, H, W, C') -view-> (N, HW/LOOP_I/d, LOOP_I, d, 1, C');   X.stride: (HWC', LOOP_I*d*C', TPB, C', C', 1)
     if f > 1:
@@ -308,8 +311,10 @@ scale_shift(
   using T_ACC = typename acc_type<T>::type;
   using V = float_vec<T, vec_elems>;
   const int Cp = C / vec_elems;
+  const int blocks_per_elem = gridDim.x / N;
   const int d = blockDim.y;
-  const int n = blockIdx.x;
+  const int n = blockIdx.x / blocks_per_elem;
+  const int by = blockIdx.x % blocks_per_elem; // hacky way to simulate blockIdx.y since blockDim.y is limited to 65K
   const int c = blockIdx.z * blockDim.x + threadIdx.x;
   if (c >= Cp) return;
 
@@ -366,7 +371,7 @@ scale_shift(
 
   for (int i = 0; i < LOOP_I; ++i) {
     int row = 0;
-    row += blockIdx.y * LOOP_I * d;
+    row += by * LOOP_I * d;
     row += i * d;
     row += threadIdx.y;
     if (row >= H * W) continue;
@@ -455,18 +460,18 @@ void run_gn_fwd_kernels(
 
     if (!ELEM_DEBUG && H * W % LOOP_I == 0) {
       auto [TPB, d, f] = calc_block_params(H * W / LOOP_I * C / vec_elems, C / vec_elems);
-      DEBUG("scale shift starting (LOOP_I = 8), N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, vec_elems: %d, by: %d\n", N, H, W, C, G, D, TPB, d, f, vec_elems, CDIV(H*W, LOOP_I*d));
+      DEBUG("scale shift starting (LOOP_I = 8), N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, vec_elems: %d, (virtual) by: %d\n", N, H, W, C, G, D, TPB, d, f, vec_elems, CDIV(H*W, LOOP_I*d));
       if (vec_elems == 4)
-        scale_shift<T, 4><<<dim3(N, CDIV(H*W, LOOP_I*d), f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, LOOP_I, act_fn_option, Y_data);
+        scale_shift<T, 4><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, H, W, C, G, LOOP_I, act_fn_option, Y_data);
       else if (vec_elems == 2)
-        scale_shift<T, 2><<<dim3(N, CDIV(H*W, LOOP_I*d), f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, LOOP_I, act_fn_option, Y_data);
+        scale_shift<T, 2><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, H, W, C, G, LOOP_I, act_fn_option, Y_data);
       else
-        scale_shift<T, 1><<<dim3(N, CDIV(H*W, LOOP_I*d), f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, LOOP_I, act_fn_option, Y_data);
+        scale_shift<T, 1><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, H, W, C, G, LOOP_I, act_fn_option, Y_data);
     }
     else {// relatively slow fallback
       auto [TPB, d, f] = calc_block_params(C, C); // each block operates only on one spatial element (on all channels) and with vec_elems = 1
       DEBUG("SLOW FALLBACK, scale shift kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, \n", N, H, W, C, G, D, TPB, d, f);
-      scale_shift<T, 1><<<dim3(N, H*W, f), dim3(TPB, 1), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, 1, act_fn_option, Y_data);
+      scale_shift<T, 1><<<dim3(N*H*W, 1, f), dim3(TPB, 1), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, H, W, C, G, 1, act_fn_option, Y_data);
     }
   }
 
@@ -500,12 +505,12 @@ sum_reduce(
 template <typename T, int64_t act_fn_option> // act_fn_option being a template param (for this fn only) causes a 5% speedup in fwd+bwd
 __global__ void
 width_reduce(
-    const T* dy_data,
-    const T* X_data,
-    const T* mean_data,
-    const T* rstd_data,
-    const T* weight_data,
-    const T* bias_data,
+    const T *dy_data,
+    const T *X_data,
+    const T *mean_data,
+    const T *rstd_data,
+    const T *weight_data,
+    const T *bias_data,
     const int H,
     const int W,
     const int C,
@@ -641,15 +646,15 @@ height_reduce(
 template <typename T>
 __global__ void
 compute_dweight_dbias(
-    const T* mean_data,
-    const T* rstd_data,
+    const T *mean_data,
+    const T *rstd_data,
     typename acc_type<T>::type *xdy_sum_data,
     typename acc_type<T>::type *dy_sum_data,
     const int N,
     const int C,
     const int G,
-    T* dweight_data,
-    T* dbias_data) {
+    T *dweight_data,
+    T *dbias_data) {
   /*
     Computes derivatives wrt the weight and bias. 
     grid: (x=f), block: (x=C/f)
@@ -676,20 +681,20 @@ compute_dweight_dbias(
 template <typename T>
 __global__ void
 compute_bwd_scale_biases(
-    const T* mean_data,
-    const T* rstd_data,
-    const T* weight_data,
-    const T* bias_data,
-    typename acc_type<T>::type* xdy_sum_data,
-    typename acc_type<T>::type* dy_sum_data,
+    const T *mean_data,
+    const T *rstd_data,
+    const T *weight_data,
+    const T *bias_data,
+    typename acc_type<T>::type *xdy_sum_data,
+    typename acc_type<T>::type *dy_sum_data,
     const int H,
     const int W,
     const int C,
     const int G,
-    typename acc_type<T>::type* fused_scale_data,
-    typename acc_type<T>::type* fused_bias_data,
-    typename acc_type<T>::type* coef1_data,
-    typename acc_type<T>::type* coef2_data) {
+    typename acc_type<T>::type *fused_scale_data,
+    typename acc_type<T>::type *fused_bias_data,
+    typename acc_type<T>::type *coef1_data,
+    typename acc_type<T>::type *coef2_data) {
   /*
     Calculates coefficients to reduce computation on the elementwise kernel.
     - fused_scale: rstd * weight
@@ -750,19 +755,20 @@ compute_bwd_scale_biases(
 template <typename T, int vec_elems>
 __global__ void
 dx_elem_kernel(
-    const T* dy_data,
-    const T* X_data,
-    typename acc_type<T>::type* fused_scale_data,
-    typename acc_type<T>::type* fused_bias_data,
-    typename acc_type<T>::type* coef1_data,
-    typename acc_type<T>::type* coef2_data,
+    const T *dy_data,
+    const T *X_data,
+    typename acc_type<T>::type *fused_scale_data,
+    typename acc_type<T>::type *fused_bias_data,
+    typename acc_type<T>::type *coef1_data,
+    typename acc_type<T>::type *coef2_data,
+    const int N,
     const int H,
     const int W,
     const int C,
     const int G,
     const int LOOP_I,
     const int act_fn_option,
-    T* dx_data) {
+    T *dx_data) {
   /*
     Performs elementwise kernel to calculate gradients wrt X. Vectorized for speed.
     LOOP_I: number of elements that each thread processes.
@@ -770,6 +776,7 @@ dx_elem_kernel(
     grid: (x=N, y=HW/LOOP_I, y=f), block: (x=TPB)
     - C' = C / vec_elems
     - f = cdiv(C', TPB) (e.g. f*TPB ~ C')
+    - note: the grid is actually (x=NHW/LOOP_I/d, y=1, z=f) since y/z max block size is 65K which causes issues for N=1, H=W=1024, C=256
     if d > 1:
       X shape: (N, H, W, C') -view-> (N, HW/LOOP_I/d, LOOP_I, d, 1, C');   X.stride: (HWC', LOOP_I*d*C', TPB, C', C', 1)
     if f > 1:
@@ -779,8 +786,10 @@ dx_elem_kernel(
   using V = float_vec<T, vec_elems>;
   using V_ACC = float_vec<T_ACC, vec_elems>;
   const int Cp = C / vec_elems;
+  const int blocks_per_elem = blockDim.x / N;
   const int d = blockDim.y;
-  const int n = blockIdx.x;
+  const int n = blockIdx.x / blocks_per_elem;
+  const int by = blockIdx.x % blocks_per_elem; // hacky way to simulate blockIdx.y since blockDim.y is limited to 65K
   const int c = blockIdx.z * blockDim.x + threadIdx.x;
   if (c >= Cp) return;
 
@@ -806,7 +815,7 @@ dx_elem_kernel(
 
   for (int i = 0; i < LOOP_I; ++i) {
     int row = 0;
-    row += blockIdx.y * LOOP_I * d;
+    row += by * LOOP_I * d;
     row += i * d;
     row += threadIdx.y;
     if (row >= H * W) continue;
@@ -950,16 +959,16 @@ void run_gn_bwd_kernels(
       auto [TPB, d, f] = calc_block_params(H * W / LOOP_I * C / vec_elems, C / vec_elems);
       DEBUG("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, vec_elems: %d\n", N, H, W, C, G, D, TPB, d, f, vec_elems);
       if (vec_elems == 4)
-        dx_elem_kernel<T, 4><<<dim3(N, CDIV(H*W, LOOP_I*d), f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, H, W, C, G, LOOP_I, act_fn_option, dx_data);
+        dx_elem_kernel<T, 4><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, H, W, C, G, LOOP_I, act_fn_option, dx_data);
       else if (vec_elems == 2)
-        dx_elem_kernel<T, 2><<<dim3(N, CDIV(H*W, LOOP_I*d), f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, H, W, C, G, LOOP_I, act_fn_option, dx_data);
+        dx_elem_kernel<T, 2><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, H, W, C, G, LOOP_I, act_fn_option, dx_data);
       else
-        dx_elem_kernel<T, 1><<<dim3(N, CDIV(H*W, LOOP_I*d), f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, H, W, C, G, LOOP_I, act_fn_option, dx_data);
+        dx_elem_kernel<T, 1><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, H, W, C, G, LOOP_I, act_fn_option, dx_data);
     }
     else { // relatively slow fallback
       auto [TPB, d, f] = calc_block_params(C, C); // each block operates only on one spatial element (on all channels) and with vec_elems = 1
       DEBUG("SLOW FALLBACK, dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d\n", N, H, W, C, G, D, TPB, f);
-      dx_elem_kernel<T, 1><<<dim3(N, H*W/d, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, H, W, C, G, 1, act_fn_option, dx_data);
+      dx_elem_kernel<T, 1><<<dim3(N * H*W/d, 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, H, W, C, G, 1, act_fn_option, dx_data);
     }
   }
 
