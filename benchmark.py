@@ -29,7 +29,7 @@ def config_filter(x): # returns true if config is valid
 
 if __name__ == '__main__':
     INCLUDE_BWD = True # benchmark forward and backward pass
-    ACT_FN = 'silu'
+    ACT_FN = 'identity'
     act_fn = {
         'identity': lambda x: x,
         'silu': F.silu,
@@ -103,8 +103,9 @@ if __name__ == '__main__':
                         speed = round(ntrials_minor / (time.time() - tic_sec), 2)
                         minor_speeds.append(speed)
 
-                        bw = gn_input.numel() * (3+5 if INCLUDE_BWD else 3) * {torch.half:2,torch.bfloat16:2, torch.float:4,torch.double:8}[DTYPE]
-                        print(f'\t\tBandwidth (GB/s): {ntrials * bw / (time.time() - tic) / 1e9:.2f}, duration: {time.time() - tic:.1f}/{NSEC} seconds completed, speed: {blue(speed)} it/s           \r', end='')
+                        bw1 = gn_input.numel() * (3+5 if INCLUDE_BWD else 3) * {torch.half:2,torch.bfloat16:2, torch.float:4,torch.double:8}[DTYPE]
+                        bw = ntrials * gn_input.nbytes * (3+5 if INCLUDE_BWD else 3) / (time.time() - tic)
+                        print(f'\t\tduration: {time.time() - tic:.1f}/{NSEC} seconds completed, bandwidth: {blue(round(bw / 1e9, 2))} GB/s, speed: {blue(speed)} it/s           \r', end='')
                         ntrials_minor = 0
                         tic_sec = time.time()
 
