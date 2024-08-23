@@ -19,10 +19,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_fwd(
   CHECK_CUDA(bias);
   const int N = X.size(0);
   const int C = X.size(1);
-  const int H = X.size(2);
-  const int W = X.size(3);
+  const int R = X.size(2);
 
-  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  at::Tensor X_nhwc = X.permute({0, 2, 1});
   at::Tensor X_out = at::empty_like(X_nhwc);
   at::Tensor means = at::empty({N, G}, weight.options());
   at::Tensor rstds = at::empty({N, G}, weight.options());
@@ -35,11 +34,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_fwd(
     run_gn_fwd_kernels<scalar_t>(
         X_nhwc.const_data_ptr<scalar_t>(),
         weight.const_data_ptr<scalar_t>(), bias.const_data_ptr<scalar_t>(),
-        N, H, W, C, G, static_cast<scalar_t>(eps), act_fn_option,
+        N, R, C, G, static_cast<scalar_t>(eps), act_fn_option,
         X_out.mutable_data_ptr<scalar_t>(), means.mutable_data_ptr<scalar_t>(), rstds.mutable_data_ptr<scalar_t>()
     );
   });
-  return {X_out.permute({0, 3, 1, 2}), means, rstds};
+  return {X_out.permute({0, 2, 1}), means, rstds};
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_bwd(
@@ -60,10 +59,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_bwd(
 
   const int N = X.size(0);
   const int C = X.size(1);
-  const int H = X.size(2);
-  const int W = X.size(3);
-  at::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
-  at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  //const int H = X.size(2);
+  //const int W = X.size(3);
+  const int R = X.size(2);
+  //at::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
+  //at::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  at::Tensor dy_nhwc = dy.permute({0, 2, 1});
+  at::Tensor X_nhwc = X.permute({0, 2, 1});
   at::Tensor dX = at::empty_like(X_nhwc);
   at::Tensor dweight = at::empty({C}, X.options());
   at::Tensor dbias = at::empty({C}, X.options());
@@ -77,11 +79,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gn_nhwc_bwd(
       dy_nhwc.const_data_ptr<scalar_t>(), X_nhwc.const_data_ptr<scalar_t>(),
       weight.const_data_ptr<scalar_t>(), bias.const_data_ptr<scalar_t>(),
       means.const_data_ptr<scalar_t>(), rstds.const_data_ptr<scalar_t>(),
-      N, H, W, C, G, act_fn_option,
+      //N, H, W, C, G, act_fn_option,
+      N, R, C, G, act_fn_option,
       dX.mutable_data_ptr<scalar_t>(), dweight.mutable_data_ptr<scalar_t>(), dbias.mutable_data_ptr<scalar_t>()
       );
   });
-  return {dX.permute({0, 3, 1, 2}), dweight, dbias};
+  //return {dX.permute({0, 3, 1, 2}), dweight, dbias};
+  return {dX.permute({0, 2, 1}), dweight, dbias};
 }
 
 //std::vector<at::Tensor> gn_nchw_fwd(

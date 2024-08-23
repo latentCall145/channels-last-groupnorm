@@ -34,18 +34,20 @@ gn_op = load(
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float, activation: str):
-        X_out, means, rstds = torch.ops.gnop.fwd(X, weight, bias, G, eps, activation)
-        ctx.save_for_backward(X, weight, bias, means, rstds)
+        ctx.x_shape = X.shape
+        X_flat = X.view(X.shape[0], X.shape[1], -1)
+        X_out, means, rstds = torch.ops.gnop.fwd(X_flat, weight, bias, G, eps, activation)
+        ctx.save_for_backward(X_flat, weight, bias, means, rstds)
         ctx.G = G
         ctx.activation = activation
-        return X_out
+        return X_out.view(ctx.x_shape)
 
     @staticmethod
     def backward(ctx, dy: torch.Tensor):
-        dy = dy.contiguous(memory_format=torch.channels_last)
-        X, weight, bias, means, rstds = ctx.saved_tensors 
-        dx, dgamma, dbeta = torch.ops.gnop.bwd(dy, X, weight, bias, means, rstds, ctx.G, ctx.activation)
-        return dx, dgamma, dbeta, None, None, None
+        X_flat, weight, bias, means, rstds = ctx.saved_tensors 
+        dy = dy.contiguous(memory_format=torch.channels_last).view(X_flat.shape)
+        dx, dgamma, dbeta = torch.ops.gnop.bwd(dy, X_flat, weight, bias, means, rstds, ctx.G, ctx.activation)
+        return dx.view(ctx.x_shape), dgamma, dbeta, None, None, None
 
 class GN_NHWC(nn.GroupNorm):
     def __init__(self, num_groups: int, num_channels: int, activation='identity', **kwargs):
@@ -63,7 +65,8 @@ class GN_NHWC(nn.GroupNorm):
 
     @torch._dynamo.disable
     def forward(self, x):
-        N, C, H, W = x.shape
+        #N, C, H, W = x.shape
+        #x = x.view(x.shape[0], x.shape[1], -1)
         G = self.num_groups
         if x.stride()[1] == 1: # channels last format
             fwd_fn = GN_NHWC_Func.apply

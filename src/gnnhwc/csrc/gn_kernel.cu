@@ -8,7 +8,7 @@
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define CDIV(a, b) (((a) + (b) - 1) / (b))
 
-#define DEBUG_ENABLED 1
+#define DEBUG_ENABLED 0
 #if DEBUG_ENABLED
 #include <iostream>
 #define DEBUG(format, args...) fprintf(stderr, format, args); std::cout << std::flush;
@@ -116,6 +116,15 @@ next_pow2(unsigned int x) {
   return x;
 }
 
+int closest_factor(int n) {
+    // finds the largest factor of n that is less than or equal to the square root of n
+    int factor = 1;
+    for (int i = 1; i * i <= n; i++)
+        if (n % i == 0)
+            factor = i;
+    return factor;
+}
+
 /////////////////// forward kernels ///////////////////
 
 template <typename T>
@@ -133,7 +142,7 @@ compute_stats_pt1(
     - TPB = Cd/f
     if TPB < C (f > 1, d=1)
       TPB = ceil(C/f) (aka f*TPB >= C)
-      X shape: (N, H, W, C) -view-> (N, H, W, 1, f, TPB); X stride: (HWC, WC, C, C, TPB, 1)
+      X shape: (N, R, C) -view-> (N, H, W, C) -view-> (N, H, W, 1, f, TPB); X stride: (HWC, WC, C, C, TPB, 1)
       dram reduction (per block): (W, 1, TPB) -reduce-> (1, TPB)
     else (block.x=C, block.y=d)
       TPB = Cd
@@ -287,8 +296,7 @@ scale_shift(
     const T *weight_data,
     const T *bias_data,
     const int N,
-    const int H,
-    const int W,
+    const int R,
     const int C,
     const int G,
     const int LOOP_I,
@@ -301,11 +309,11 @@ scale_shift(
     grid: (x=N, y=HW/LOOP_I/d, z=f), block: (x=TPB/d, y=d)
     - C' = C / vec_elems
     - f = cdiv(C', TPB) (e.g. f*TPB ~ C')
-    - note: the grid is actually (x=NHW/LOOP_I/d, y=1, z=f) since y/z max block size is 65K which causes issues for N=1, H=W=1024, C=256
+    - note: the grid is actually (x=NR/LOOP_I/d, y=1, z=f) since y/z max block size is 65K which causes issues for N=1, H=W=1024, C=256
     if d > 1:
-      X shape: (N, H, W, C') -view-> (N, HW/LOOP_I/d, LOOP_I, d, 1, C');   X.stride: (HWC', LOOP_I*d*C', TPB, C', C', 1)
+      X shape: (N, R, C') -view-> (N, R/LOOP_I/d, LOOP_I, d, 1, C');   X.stride: (RC', LOOP_I*d*C', TPB, C', C', 1)
     if f > 1:
-      X shape: (N, H, W, C') -view-> (N, HW/LOOP_I/1, LOOP_I, 1, f, TPB); X.stride: (HWC', LOOP_I*C', C', C', TPB, 1)
+      X shape: (N, R, C') -view-> (N, R/LOOP_I/1, LOOP_I, 1, f, TPB); X.stride: (RC', LOOP_I*C', C', C', TPB, 1)
    */
   using T_ACC = typename acc_type<T>::type;
   using V = float_vec<T, vec_elems>;
@@ -373,10 +381,10 @@ scale_shift(
     row += by * LOOP_I * d;
     row += i * d;
     row += threadIdx.y;
-    if (row >= H * W) continue;
+    if (row >= R) continue;
 
     int idx = 0;
-    idx += n * H * W * Cp;
+    idx += n * R * Cp;
     idx += row * Cp;
     idx += c;
 
@@ -407,8 +415,7 @@ void run_gn_fwd_kernels(
     const T *weight_data,
     const T *bias_data,
     const int N,
-    const int H,
-    const int W,
+    const int R,
     const int C,
     const int G,
     T eps,
@@ -419,6 +426,8 @@ void run_gn_fwd_kernels(
   using T_ACC = typename acc_type<T>::type;
   using WelfordType = WelfordData<T_ACC, INT>;
 
+  const int H = closest_factor(R);
+  const int W = R / H;
   auto [TPB, d, f1] = calc_block_params(W * C, C, C / G);
   const int gf = CDIV(G, f1); // number of groups processed per block in compute_stats_pt1, needed here because it determines size of welford_data
   const int fgf = (gf == 1) ? f1 : G; // f1 * gf but in case gf > 1, return G (e.g. G=1031, f1=6, gf=172, f1*gf=1032 != 1031)
@@ -457,30 +466,30 @@ void run_gn_fwd_kernels(
     else vec_elems = 1;
     const int LOOP_I = 8;
 
-    if (!ELEM_DEBUG && H * W % LOOP_I == 0) {
-      auto [TPB, d, f] = calc_block_params(H * W / LOOP_I * C / vec_elems, C / vec_elems);
-      DEBUG("scale shift starting (LOOP_I = 8), N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, vec_elems: %d, (virtual) by: %d\n", N, H, W, C, G, D, TPB, d, f, vec_elems, CDIV(H*W, LOOP_I*d));
+    if (!ELEM_DEBUG && R % LOOP_I == 0) {
+      auto [TPB, d, f] = calc_block_params(R / LOOP_I * C / vec_elems, C / vec_elems);
+      DEBUG("scale shift starting (LOOP_I = 8), N: %d, R: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, vec_elems: %d, (virtual) by: %d\n", N, R, C, G, D, TPB, d, f, vec_elems, CDIV(H*W, LOOP_I*d));
       if (vec_elems == 4)
-        scale_shift<T, 4><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, H, W, C, G, LOOP_I, act_fn_option, Y_data);
+        scale_shift<T, 4><<<dim3(N * CDIV(R, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, R, C, G, LOOP_I, act_fn_option, Y_data);
       else if (vec_elems == 2)
-        scale_shift<T, 2><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, H, W, C, G, LOOP_I, act_fn_option, Y_data);
+        scale_shift<T, 2><<<dim3(N * CDIV(R, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, R, C, G, LOOP_I, act_fn_option, Y_data);
       else
-        scale_shift<T, 1><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, H, W, C, G, LOOP_I, act_fn_option, Y_data);
+        scale_shift<T, 1><<<dim3(N * CDIV(R, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, R, C, G, LOOP_I, act_fn_option, Y_data);
     }
     else {// relatively slow fallback
       auto [TPB, d, f] = calc_block_params(C, C); // each block operates only on one spatial element (on all channels) and with vec_elems = 1
-      DEBUG("SLOW FALLBACK, scale shift kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, \n", N, H, W, C, G, D, TPB, d, f);
-      scale_shift<T, 1><<<dim3(N*H*W, 1, f), dim3(TPB, 1), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, H, W, C, G, 1, act_fn_option, Y_data);
+      DEBUG("SLOW FALLBACK, scale shift kernel starting, N: %d, R: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, \n", N, R, C, G, D, TPB, d, f);
+      scale_shift<T, 1><<<dim3(N*R, 1, f), dim3(TPB, 1), 0, cuda_stream>>>(X_data, mean_data, rstd_data, weight_data, bias_data, N, R, C, G, 1, act_fn_option, Y_data);
     }
   }
 
   c10::cuda::CUDACachingAllocator::raw_delete(welford_data);
 }
 
-template void run_gn_fwd_kernels<float>(const float *X_data, const float *weight_data, const float *bias_data, const int N, const int h, const int W, const int C, const int G, float eps, const int64_t act_fn_option, float *Y_data, float *mean_data, float *rstd_data);
-template void run_gn_fwd_kernels<double>(const double *X_data, const double *weight_data, const double *bias_data, const int N, const int h, const int W, const int C, const int G, double eps, const int64_t act_fn_option, double *Y_data, double *mean_data, double *rstd_data);
-template void run_gn_fwd_kernels<c10::Half>(const c10::Half *X_data, const c10::Half *weight_data, const c10::Half *bias_data, const int N, const int h, const int W, const int C, const int G, c10::Half eps, const int64_t act_fn_option, c10::Half *Y_data, c10::Half *mean_data, c10::Half *rstd_data);
-template void run_gn_fwd_kernels<c10::BFloat16>(const c10::BFloat16 *X_data, const c10::BFloat16 *weight_data, const c10::BFloat16 *bias_data, const int N, const int h, const int W, const int C, const int G, c10::BFloat16 eps, const int64_t act_fn_option, c10::BFloat16 *Y_data, c10::BFloat16 *mean_data, c10::BFloat16 *rstd_data);
+template void run_gn_fwd_kernels<float>(const float *X_data, const float *weight_data, const float *bias_data, const int N, const int R, const int C, const int G, float eps, const int64_t act_fn_option, float *Y_data, float *mean_data, float *rstd_data);
+template void run_gn_fwd_kernels<double>(const double *X_data, const double *weight_data, const double *bias_data, const int N, const int R, const int C, const int G, double eps, const int64_t act_fn_option, double *Y_data, double *mean_data, double *rstd_data);
+template void run_gn_fwd_kernels<c10::Half>(const c10::Half *X_data, const c10::Half *weight_data, const c10::Half *bias_data, const int N, const int R, const int C, const int G, c10::Half eps, const int64_t act_fn_option, c10::Half *Y_data, c10::Half *mean_data, c10::Half *rstd_data);
+template void run_gn_fwd_kernels<c10::BFloat16>(const c10::BFloat16 *X_data, const c10::BFloat16 *weight_data, const c10::BFloat16 *bias_data, const int N, const int R, const int C, const int G, c10::BFloat16 eps, const int64_t act_fn_option, c10::BFloat16 *Y_data, c10::BFloat16 *mean_data, c10::BFloat16 *rstd_data);
 
 /////////////////// backward kernels ///////////////////
 
@@ -686,8 +695,7 @@ compute_bwd_scale_biases(
     const T *bias_data,
     typename acc_type<T>::type *xdy_sum_data,
     typename acc_type<T>::type *dy_sum_data,
-    const int H,
-    const int W,
+    const int R,
     const int C,
     const int G,
     typename acc_type<T>::type *fused_scale_data,
@@ -745,7 +753,7 @@ compute_bwd_scale_biases(
   if (threadIdx.x != 0) return;
   const T_ACC xdy_gamma_sum = vals_reduced[0];
   const T_ACC dy_gamma_sum = vals_reduced[1];
-  const T_ACC s = T_ACC(1) / static_cast<T_ACC>(D * H * W);
+  const T_ACC s = T_ACC(1) / static_cast<T_ACC>(D * R);
   const T_ACC x = (mean_elem * dy_gamma_sum - xdy_gamma_sum) * s * rstd_elem * rstd_elem * rstd_elem;
   coef1_data[ng] = x;
   coef2_data[ng] = -mean_elem * x - (dy_gamma_sum * s * rstd_elem);
@@ -761,8 +769,7 @@ dx_elem_kernel(
     typename acc_type<T>::type *coef1_data,
     typename acc_type<T>::type *coef2_data,
     const int N,
-    const int H,
-    const int W,
+    const int R,
     const int C,
     const int G,
     const int LOOP_I,
@@ -775,11 +782,11 @@ dx_elem_kernel(
     grid: (x=N, y=HW/LOOP_I, y=f), block: (x=TPB)
     - C' = C / vec_elems
     - f = cdiv(C', TPB) (e.g. f*TPB ~ C')
-    - note: the grid is actually (x=NHW/LOOP_I/d, y=1, z=f) since y/z max block size is 65K which causes issues for N=1, H=W=1024, C=256
+    - note: the grid is actually (x=NR/LOOP_I/d, y=1, z=f) since y/z max block size is 65K which causes issues for N=1, R=1024*1024, C=256
     if d > 1:
-      X shape: (N, H, W, C') -view-> (N, HW/LOOP_I/d, LOOP_I, d, 1, C');   X.stride: (HWC', LOOP_I*d*C', TPB, C', C', 1)
+      X shape: (N, R, C') -view-> (N, R/LOOP_I/d, LOOP_I, d, 1, C');   X.stride: (RC', LOOP_I*d*C', TPB, C', C', 1)
     if f > 1:
-      X shape: (N, H, W, C') -view-> (N, HW/LOOP_I/1, LOOP_I, 1, f, TPB); X.stride: (HWC', LOOP_I*C', C', C', TPB, 1)
+      X shape: (N, R, C') -view-> (N, R/LOOP_I/1, LOOP_I, 1, f, TPB); X.stride: (RC', LOOP_I*C', C', C', TPB, 1)
    */
   using T_ACC = typename acc_type<T>::type;
   using V = float_vec<T, vec_elems>;
@@ -817,10 +824,10 @@ dx_elem_kernel(
     row += by * LOOP_I * d;
     row += i * d;
     row += threadIdx.y;
-    if (row >= H * W) continue;
+    if (row >= R) continue;
 
     int idx = 0;
-    idx += n * H * W * Cp;
+    idx += n * R * Cp;
     idx += row * Cp;
     idx += c;
 
@@ -876,8 +883,7 @@ void run_gn_bwd_kernels(
     const T *mean_data,
     const T *rstd_data,
     const int N,
-    const int H,
-    const int W,
+    const int R,
     const int C,
     const int G,
     const int64_t act_fn_option,
@@ -888,6 +894,8 @@ void run_gn_bwd_kernels(
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
   const int D = C / G;
 
+  const int H = closest_factor(R);
+  const int W = R / H;
   T_ACC* xdy_dy_sum_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C * H * 2);
 
   // sum over W dim
@@ -922,7 +930,7 @@ void run_gn_bwd_kernels(
   // compute weight/bias grads
   {
     auto [TPB, d, f] = calc_block_params(C, C);
-    DEBUG("starting compute dweight dbias, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
+    DEBUG("starting compute dweight dbias, N: %d, R: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, R, C, G, TPB, d, f);
     compute_dweight_dbias<<<f, TPB, 0, cuda_stream>>>(
         mean_data, rstd_data,
         xdy_sum_data, dy_sum_data,
@@ -938,11 +946,11 @@ void run_gn_bwd_kernels(
   // compute fused scales/biases for X grads
   {
     auto [TPB, d, f] = calc_block_params(D, D);
-    DEBUG("starting bwd scale biases, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, H, W, C, G, TPB, d, f);
+    DEBUG("starting bwd scale biases, N: %d, R: %d, C: %d, G: %d, TPB: %d, d: %d, f: %d\n", N, R, C, G, TPB, d, f);
     compute_bwd_scale_biases<<<dim3(N, G), TPB, sizeof(T_ACC) * 2*TPB, cuda_stream>>>(
         mean_data, rstd_data, weight_data, bias_data,
         xdy_sum_data, dy_sum_data,
-        H, W, C, G,
+        R, C, G,
         fused_scale_data, fused_bias_data, coef1_data, coef2_data);
   }
 
@@ -954,20 +962,20 @@ void run_gn_bwd_kernels(
     else vec_elems = 1;
     const int LOOP_I = 8;
 
-    if (!ELEM_DEBUG && H * W % LOOP_I == 0) {
-      auto [TPB, d, f] = calc_block_params(H * W / LOOP_I * C / vec_elems, C / vec_elems);
-      DEBUG("dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, vec_elems: %d\n", N, H, W, C, G, D, TPB, d, f, vec_elems);
+    if (!ELEM_DEBUG && R % LOOP_I == 0) {
+      auto [TPB, d, f] = calc_block_params(R / LOOP_I * C / vec_elems, C / vec_elems);
+      DEBUG("dx elem kernel starting, N: %d, R: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, vec_elems: %d\n", N, R, C, G, D, TPB, d, f, vec_elems);
       if (vec_elems == 4)
-        dx_elem_kernel<T, 4><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, H, W, C, G, LOOP_I, act_fn_option, dx_data);
+        dx_elem_kernel<T, 4><<<dim3(N * CDIV(R, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, LOOP_I, act_fn_option, dx_data);
       else if (vec_elems == 2)
-        dx_elem_kernel<T, 2><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, H, W, C, G, LOOP_I, act_fn_option, dx_data);
+        dx_elem_kernel<T, 2><<<dim3(N * CDIV(R, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, LOOP_I, act_fn_option, dx_data);
       else
-        dx_elem_kernel<T, 1><<<dim3(N * CDIV(H*W, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, H, W, C, G, LOOP_I, act_fn_option, dx_data);
+        dx_elem_kernel<T, 1><<<dim3(N * CDIV(R, LOOP_I*d), 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, LOOP_I, act_fn_option, dx_data);
     }
     else { // relatively slow fallback
       auto [TPB, d, f] = calc_block_params(C, C); // each block operates only on one spatial element (on all channels) and with vec_elems = 1
-      DEBUG("SLOW FALLBACK, dx elem kernel starting, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d\n", N, H, W, C, G, D, TPB, f);
-      dx_elem_kernel<T, 1><<<dim3(N * H*W/d, 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, H, W, C, G, 1, act_fn_option, dx_data);
+      DEBUG("SLOW FALLBACK, dx elem kernel starting, N: %d, R: %d, C: %d, G: %d, D: %d, TPB: %d, f: %d\n", N, R, C, G, D, TPB, f);
+      dx_elem_kernel<T, 1><<<dim3(N * R/d, 1, f), dim3(TPB/d, d), 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, 1, act_fn_option, dx_data);
     }
   }
 
@@ -979,7 +987,7 @@ void run_gn_bwd_kernels(
   c10::cuda::CUDACachingAllocator::raw_delete(coef2_data);
 }
 
-template void run_gn_bwd_kernels<double>(const double *dy_data, const double *X_data, const double *weight_data, const double *bias_data, const double *mean_data, const double *rstd_data, const int N, const int H, const int W, const int C, const int G, const int64_t act_fn_option, double *dx_data, double *dweight_data, double *dbias_data);
-template void run_gn_bwd_kernels<float>(const float *dy_data, const float *X_data, const float *weight_data, const float *bias_data, const float *mean_data, const float *rstd_data, const int N, const int H, const int W, const int C, const int G, const int64_t act_fn_option, float *dx_data, float *dweight_data, float *dbias_data);
-template void run_gn_bwd_kernels<c10::Half>(const c10::Half *dy_data, const c10::Half *X_data, const c10::Half *weight_data, const c10::Half *bias_data, const c10::Half *mean_data, const c10::Half *rstd_data, const int N, const int H, const int W, const int C, const int G, const int64_t act_fn_option, c10::Half *dx_data, c10::Half *dweight_data, c10::Half *dbias_data);
-template void run_gn_bwd_kernels<c10::BFloat16>(const c10::BFloat16 *dy_data, const c10::BFloat16 *X_data, const c10::BFloat16 *weight_data, const c10::BFloat16 *bias_data, const c10::BFloat16 *mean_data, const c10::BFloat16 *rstd_data, const int N, const int H, const int W, const int C, const int G, const int64_t act_fn_option, c10::BFloat16 *dx_data, c10::BFloat16 *dweight_data, c10::BFloat16 *dbias_data);
+template void run_gn_bwd_kernels<double>(const double *dy_data, const double *X_data, const double *weight_data, const double *bias_data, const double *mean_data, const double *rstd_data, const int N, const int R, const int C, const int G, const int64_t act_fn_option, double *dx_data, double *dweight_data, double *dbias_data);
+template void run_gn_bwd_kernels<float>(const float *dy_data, const float *X_data, const float *weight_data, const float *bias_data, const float *mean_data, const float *rstd_data, const int N, const int R, const int C, const int G, const int64_t act_fn_option, float *dx_data, float *dweight_data, float *dbias_data);
+template void run_gn_bwd_kernels<c10::Half>(const c10::Half *dy_data, const c10::Half *X_data, const c10::Half *weight_data, const c10::Half *bias_data, const c10::Half *mean_data, const c10::Half *rstd_data, const int N, const int R, const int C, const int G, const int64_t act_fn_option, c10::Half *dx_data, c10::Half *dweight_data, c10::Half *dbias_data);
+template void run_gn_bwd_kernels<c10::BFloat16>(const c10::BFloat16 *dy_data, const c10::BFloat16 *X_data, const c10::BFloat16 *weight_data, const c10::BFloat16 *bias_data, const c10::BFloat16 *mean_data, const c10::BFloat16 *rstd_data, const int N, const int R, const int C, const int G, const int64_t act_fn_option, c10::BFloat16 *dx_data, c10::BFloat16 *dweight_data, c10::BFloat16 *dbias_data);
