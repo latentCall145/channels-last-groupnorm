@@ -1,3 +1,4 @@
+from gnnhwc import GN_NHWC
 from tqdm import tqdm
 import torch.nn.functional as F
 import torch.nn as nn
@@ -174,174 +175,76 @@ if __name__ == '__main__':
     MODE = 'check' # can be 'check', 'bench', other modes do both
     CHECK_PROF = len(sys.argv) > 1 and sys.argv[1] == '1'
 
-    if MODE != 'bench':
-        Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
-        Cs = (
-            1, 2, 3, 4, 5, 6, 7, 32, 64, 128, 256, 512,
-            13, 140, 125, 961,
-            160, 320, 640, 960, 1280, 1600, 1920, 2240, 2560, 1303, 2602, 3909
-        )
-        Rs = (
-            2, 3, 4, 5, 6, 7, 8, 9, 10, 17,
-            8, 16, 64, 128, 256, 512,
-            1024,
-        )
-        Gs = (1, 2, 3, 4, 8, 16, 32,)
-        all_params = itertools.product([torch.float], Bs, Cs, Rs, Gs)
+    Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
+    Cs = (
+        1, 2, 3, 4, 5, 6, 7, 32, 64, 128, 256, 512,
+        13, 140, 125, 961,
+        160, 320, 640, 960, 1280, 1600, 1920, 2240, 2560, 1303, 2602, 3909
+    )
+    Rs = (
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 17,
+        8, 16, 64, 128, 256, 512,
+        1024,
+    )
+    Gs = (1, 2, 3, 4, 8, 16, 32,)
+    all_params = itertools.product([torch.float], Bs, Cs, Rs, Gs)
 
-        inputs = [
-            #(torch.double, 1, 1, 2, 1),
+    inputs = [
+        #(torch.double, 1, 1, 2, 1),
 
-            #(torch.double, 2, 3909, 5, 3),
-            #(torch.double, 1, 2062, 5, 1031),
-            #(torch.double, 3, 4096, 7, 4),
-            #(torch.double, 1, 4096, 7, 4),
+        #(torch.double, 2, 3909, 5, 3),
+        #(torch.double, 1, 2062, 5, 1031),
+        #(torch.double, 3, 4096, 7, 4),
+        #(torch.double, 1, 4096, 7, 4),
 
-            #(torch.double, 2, 160, 8, 160),
-            #(torch.double, 1, 3, 7, 1),
-            #(torch.double, 1, 1, 4, 1),
-            #(torch.double, 1, 128, 8, 8),
-            #(torch.double, 2, 1280, 8, 32),
-            #(torch.double, 2, 640, 16, 32),
-            #(torch.double, 2, 2560, 8, 32),
-            #(torch.double, 2, 1280, 16, 32),
-            #(torch.double, 2, 320, 32, 32),
-            #(torch.double, 2, 1920, 16, 32),
-            #(torch.double, 2, 2560, 16, 32),
-            #(torch.double, 2, 640, 32, 32),
-            #(torch.double, 2, 960, 32, 32),
-            #(torch.double, 2, 1280, 32, 32),
-            #(torch.double, 2, 320, 64, 32),
-            #(torch.double, 2, 1920, 32, 32),
-            #(torch.double, 2, 640, 64, 32),
-            #(torch.float, 1, 64, 256, 32),
-            #(torch.float, 2, 64, 512, 32),
-            (torch.double, 8, 128, 64, 32),
-        ]
-        inputs = None
+        #(torch.double, 2, 160, 8, 160),
+        #(torch.double, 1, 3, 7, 1),
+        #(torch.double, 1, 1, 4, 1),
+        #(torch.double, 1, 128, 8, 8),
+        #(torch.double, 2, 1280, 8, 32),
+        #(torch.double, 2, 640, 16, 32),
+        #(torch.double, 2, 2560, 8, 32),
+        #(torch.double, 2, 1280, 16, 32),
+        #(torch.double, 2, 320, 32, 32),
+        #(torch.double, 2, 1920, 16, 32),
+        #(torch.double, 2, 2560, 16, 32),
+        #(torch.double, 2, 640, 32, 32),
+        #(torch.double, 2, 960, 32, 32),
+        #(torch.double, 2, 1280, 32, 32),
+        #(torch.double, 2, 320, 64, 32),
+        #(torch.double, 2, 1920, 32, 32),
+        #(torch.double, 2, 640, 64, 32),
+        #(torch.float, 1, 64, 256, 32),
+        #(torch.float, 2, 64, 512, 32),
+        #(torch.double, 8, 128, 64, 32),
+        #(torch.half, 2, 128, 128, 32),
+        (torch.half, 2, 256, 128, 32),
+        #(torch.half, 2, 512, 128, 32),
+    ]
+    inputs = None
 
-        err_inputs = filter(config_filter, all_params)
+    err_inputs = filter(config_filter, all_params)
 
-        if inputs is None: # run on cartesian product of inputs
-            for DTYPE in [torch.float, torch.double]: # run tests on low-precision dtypes and rerunning failing tests on higher-precision dtypes to see if there's an actual problem in the code or just a precision error
-                inputs = [(DTYPE, *params[1:]) for params in err_inputs]
-                err_inputs = []
-                for params in tqdm(sorted(
-                    inputs,
-                    key = lambda x: x[1]*x[2]*x[3]*x[4]
-                )):
-                    err_params = check_params(params)
-                    if err_params:
-                        err_inputs.append(params)
-        else:
+    if inputs is None: # run on cartesian product of inputs
+        for DTYPE in [torch.float, torch.double]: # run tests on low-precision dtypes and rerunning failing tests on higher-precision dtypes to see if there's an actual problem in the code or just a precision error
+            inputs = [(DTYPE, *params[1:]) for params in err_inputs]
             err_inputs = []
-            for params in tqdm(inputs):
+            for params in tqdm(sorted(
+                inputs,
+                key = lambda x: x[1]*x[2]*x[3]*x[4]
+            )):
                 err_params = check_params(params)
                 if err_params:
                     err_inputs.append(params)
+    else:
+        err_inputs = []
+        for params in tqdm(inputs):
+            err_params = check_params(params)
+            if err_params:
+                err_inputs.append(params)
 
-        if len(err_inputs) > 0:
-            print(red('Error inputs found:'))
-            print(err_inputs)
-        elif not CHECK_PROF:
-            print(green('No errors found :)'))
-
-    if MODE != 'check':
-        NSEC = 1 # number of seconds that each kernel runs for on a certain input
-        DTYPES = [torch.bfloat16]
-        #BATCHES = [1, 2, 4, 8, 16, 32]
-        #CHANNELS = [32, 64, 128]
-        #RESOLUTIONS = [4, 8, 16, 32, 64, 128, 256, 512]
-        #NUM_GROUPS = [32]
-
-        BATCHES = [1, 8]
-        CHANNELS = [32, 128]
-        RESOLUTIONS = [64, 512]
-        NUM_GROUPS = [32]
-
-        BENCH = 'bwd' # can be 'fwd', anything else is fwd + bwd
-        GN_KERNELS = [
-                #(GN_NCHW, 'torch.nn GN NCHW (compiled from src)'),
-                (nn.GroupNorm, 'torch.nn GN NCHW'),
-                (GN_NHWC, 'GN NHWC'),
-        ]
-
-        os.makedirs('csvs', exist_ok=True)
-        fname = datetime.datetime.now().strftime("csvs/%H-%M-%S-%d-%m-%Y.csv")
-        print(f'Writing to {fname}')
-        outfile = open(fname, 'w')
-        outfile.write('Kernel,B (batch),C (num channels),R (resolution),G (num groups), D (C/G),Speed (it/s; 25th percentile),Speed (it/s; 50th percentile),Speed (it/s; 75th percentile)\n')
-        
-        configs = list(filter(config_filter, itertools.product(DTYPES, BATCHES, CHANNELS, RESOLUTIONS, NUM_GROUPS)))
-        print('Estimated time (seconds) to complete:', NSEC * len(configs) * len(GN_KERNELS))
-
-        for DTYPE, B, C, R, G in configs:
-            x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda', requires_grad=True)
-            x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).detach().requires_grad_(True)
-
-            gn_args = (G, C)
-            print(blue(f'benchmark ({BENCH}) | DTYPE: {DTYPE} | B: {B} | C: {C} | R: {R} | G: {G}'))
-            for gn_class, desc in GN_KERNELS:
-                gn_input = x_nchw if 'NCHW' in desc else x_nhwc
-                grad = torch.ones_like(gn_input)
-                print(f'\t{desc}')
-
-                try:
-                    gn_layer = gn_class(*gn_args).to(DTYPE).cuda()
-
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        g = gn_layer(gn_input)
-                        if not isinstance(gn_layer, GN_NHWC):
-                            g = act_fn(g)
-                        if BENCH != 'fwd':
-                            g.backward(grad)
-                    torch.cuda.synchronize()
-
-                    tic = time.time()
-                    tic_sec = time.time()
-                    ntrials = ntrials_minor = 0
-                    minor_speeds = [] # used to track speed percentiles since they can often vary by a lot
-
-                    while time.time() - tic < NSEC:
-                        graph.replay()
-
-                        #g = gn_layer(gn_input)
-                        #if not isinstance(gn_layer, GN_NHWC):
-                        #    g = act_fn(g)
-                        #if BENCH != 'fwd':
-                        #    g.sum().backward()
-
-                        torch.cuda.synchronize()
-                        ntrials += 1
-                        ntrials_minor += 1
-
-                        if time.time() - tic_sec > 0.1:
-                            speed = round(ntrials_minor / (time.time() - tic_sec), 2)
-                            minor_speeds.append(speed)
-
-                            bw = gn_input.numel() * (3 if BENCH == 'fwd' else 3+5) * {torch.half:2,torch.bfloat16:2, torch.float:4,torch.double:8}[DTYPE]
-                            print(f'\t\tBandwidth (GB/s): {ntrials * bw / (time.time() - tic) / 1e9:.2f}, duration: {time.time() - tic:.1f}/{NSEC} seconds completed, speed: {blue(speed)} it/s           \r', end='')
-                            #print(f'\t\t{round(time.time() - tic, 1)}/{NSEC} seconds completed, speed: {blue(speed)} it/s\r', end='')
-                            ntrials_minor = 0
-                            tic_sec = time.time()
-
-                    minor_speeds = np.array(minor_speeds)
-                    median_speed = round(np.percentile(minor_speeds, 50), 2)
-                    slow_speed = round(np.percentile(minor_speeds, 25), 2)
-                    fast_speed = round(np.percentile(minor_speeds, 75), 2)
-                    print(f'\n\t\tSpeed (25th/50th/75th percentile): {red(slow_speed)}/{yellow(median_speed)}/{green(fast_speed)} it/s')
-                except KeyboardInterrupt:
-                    print(f'Keyboard interrupt, closing {fname}.')
-                    outfile.close()
-                    raise
-                except Exception as e:
-                    print('\t\tFAILED; Error:', str(e).strip())
-                    raise
-                    median_speed = slow_speed = fast_speed = '-1 (failed)'
-                
-                outfile.write(f'{desc},{B},{C},{R},{G},{C//G},{slow_speed},{median_speed},{fast_speed}\n')
-            print()
-        print(f'All tests done, closing {fname}.')
-        outfile.close()
-
+    if len(err_inputs) > 0:
+        print(red('Error inputs found:'))
+        print(err_inputs)
+    elif not CHECK_PROF:
+        print(green('No errors found :)'))

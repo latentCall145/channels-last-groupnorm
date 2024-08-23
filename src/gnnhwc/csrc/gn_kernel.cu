@@ -6,9 +6,9 @@
 #define MAX_THREADS_PER_BLOCK 128 // seems to work slightly better than 256/512/1024
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
-#define CDIV(a, b) ((a) + (b) - 1) / (b)
+#define CDIV(a, b) (((a) + (b) - 1) / (b))
 
-#define DEBUG_ENABLED 0
+#define DEBUG_ENABLED 1
 #if DEBUG_ENABLED
 #include <iostream>
 #define DEBUG(format, args...) fprintf(stderr, format, args); std::cout << std::flush;
@@ -251,7 +251,6 @@ compute_stats_pt2(
     idx += r;
     val = welford_op.combine(val, welford_data[idx]);
   }
-  //printf("gn_kernel 254 n: %d, nf: %f\n", val.n, val.nf);
 
   // shmem reduction
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[MAX_THREADS_PER_BLOCK];
@@ -786,7 +785,7 @@ dx_elem_kernel(
   using V = float_vec<T, vec_elems>;
   using V_ACC = float_vec<T_ACC, vec_elems>;
   const int Cp = C / vec_elems;
-  const int blocks_per_elem = blockDim.x / N;
+  const int blocks_per_elem = gridDim.x / N;
   const int d = blockDim.y;
   const int n = blockIdx.x / blocks_per_elem;
   const int by = blockIdx.x % blocks_per_elem; // hacky way to simulate blockIdx.y since blockDim.y is limited to 65K
