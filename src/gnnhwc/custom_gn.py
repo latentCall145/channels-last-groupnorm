@@ -3,8 +3,6 @@ import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 import torch, datetime, time, os, itertools, sys
-#torch.set_printoptions(sci_mode=False, edgeitems=8, linewidth=160,precision=12)
-torch.set_printoptions(sci_mode=False, edgeitems=1)
 module_dir = os.path.dirname(os.path.abspath(__file__))
 
 from torch.utils.cpp_extension import load
@@ -13,7 +11,6 @@ gn_op = load(
         sources=[
             os.path.join(module_dir, "csrc/custom_gn.cpp"),
             os.path.join(module_dir, "csrc/gn_kernel.cu"),
-            #os.path.join(module_dir, csrc/"nchw_kernel.cu")
             ],
         extra_cuda_cflags=[
             '-use_fast_math',
@@ -87,29 +84,3 @@ class GN_NHWC(nn.GroupNorm):
     def extra_repr(self):
         return '{num_groups}, {num_channels}, eps={eps}, ' \
             'affine={affine}, activation={activation}'.format(**self.__dict__)
-
-class GN_NCHW_Func(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
-        X_out, means, rstds = torch.ops.gnop.nchw_fwd(X, weight, bias, G, eps)
-        ctx.save_for_backward(X, weight, means, rstds)
-        ctx.G = G
-        return X_out
-
-    @staticmethod
-    def backward(ctx, dy):
-        X, weight, means, rstds = ctx.saved_tensors 
-        dx, dgamma, dbeta = torch.ops.gnop.nchw_bwd(dy, X, weight, means, rstds, ctx.G)
-        return dx, dgamma, dbeta, None, None
-
-class GN_NCHW(nn.GroupNorm):
-    def __init__(self, num_groups: int, num_channels: int, **kwargs):
-        super().__init__(num_groups, num_channels, **kwargs)
-
-    def forward(self, x):
-        if self.affine:
-            return GN_NCHW_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
-        else:
-            w = torch.ones((self.num_channels,), device=x.device, dtype=x.dtype)
-            b = torch.zeros((self.num_channels,), device=x.device, dtype=x.dtype)
-            return GN_NCHW_Func.apply(x, w, b, self.num_groups, self.eps)
