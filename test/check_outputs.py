@@ -52,29 +52,44 @@ def green(text): return '\033[92m' + str(text) + '\033[0m'
 def yellow(text): return '\033[93m' + str(text) + '\033[0m'
 def blue(text): return '\033[94m' + str(text) + '\033[0m'
 
+def get_act_fn(act_str):
+    return {
+        'identity': lambda x: x,
+        'silu': F.silu,
+        'relu': F.relu,
+        'gelu': F.gelu,
+        'gelu_tanh': lambda x: F.gelu(x, approximate='tanh'),
+    }[act_str]
+
 def config_filter(x): # returns true if config is valid
-    DTYPE, B, C, R, G = x
+    ACT_FN, DTYPE, B, C, H, W, G = x
     if C % G != 0:
         return False
-    if R == 1: # this causes an autograd problem where it gets confused since the tensor is both contiguous in NCHW/NHWC format 
+    if H * W == 1: # this causes an autograd problem where it gets confused since the tensor is both contiguous in NCHW/NHWC format 
         return False
 
-    dtype_size = {torch.half: 2, torch.bfloat16: 2, torch.float: 4, torch.double: 8}[DTYPE] # only care about 16/32-bit dtypes for now
-    #estimated_mem_usage_gib = (25 * dtype_size * B * C * R * R) / 2**30 #  this is just a rough estimate, likely wrong
-    estimated_mem_usage_gib = (5 * dtype_size * B * C * R * R) / 2**30 #  this is just a rough estimate, likely wrong
+    dtype_size = torch.finfo(DTYPE).bits / 8
+    estimated_mem_usage_gib = (25 * dtype_size * B * C * H * W) / 2**30 #  this is just a rough estimate, likely wrong
     if estimated_mem_usage_gib > 3: # vram filter
         return False
     return True
 
+ERRS = {
+    torch.bfloat16: 1e-6,
+    torch.float16: 1e-7,
+    torch.float: 1e-10,
+    torch.double: 1e-20,
+}
+
 bigx = None
-def check_params(params, verbose=True):
+def check_params(params, verbose=False):
     global bigx
     if bigx is None:
         bigx = torch.randn(128*1024*1024)
     vprint = lambda *args, **kwargs: print(*args, **kwargs) if verbose else None
-    DTYPE, B, C, R, G = params
-    vprint(blue(f'output testing | DTYPE: {DTYPE} |B: {B:<2} | C: {C:<4} | R: {R:<4} | G: {G:<3}'))
-    xc = bigx[:B*C*R*R].reshape((B, C, R, R)).to(DTYPE).cuda()
+    ACT_FN, DTYPE, B, C, H, W, G = params
+    vprint(blue(f'output testing | ACT_FN: {ACT_FN} | DTYPE: {DTYPE} |B: {B:<2} | C: {C:<4} | H: {H:<4} | W: {W:<4} | G: {G:<3}'))
+    xc = bigx[:B*C*H*W].reshape((B, C, H, W)).to(DTYPE).cuda()
     x = xc.to(memory_format=torch.channels_last)
     xc.requires_grad_(True)
     x.requires_grad_(True)
@@ -82,99 +97,104 @@ def check_params(params, verbose=True):
 
     gn2 = GN_NHWC(G, C, activation=ACT_FN).cuda().to(DTYPE)
 
-    if CHECK_PROF:
-        gn2(x).sum().backward()
-        gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
-        gn1(x.contiguous()).sum().backward()
-    else:
-        gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
-        gnref = GN_Naive(G, C).cuda().to(DTYPE)
+    gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
+    act_fn = get_act_fn(ACT_FN)
+    gnref = GN_Naive(G, C).cuda().to(DTYPE)
+    with torch.no_grad(): # copy weights
+        w = torch.randn((C,), dtype=DTYPE)
+        b = torch.randn((C,), dtype=DTYPE)
+        gn1.weight.copy_(w.detach().float())
+        gn1.bias.copy_(b.detach().float())
+        gn2.weight.copy_(w.detach())
+        gn2.bias.copy_(b.detach())
+        gnref.weight.copy_(w.detach())
+        gnref.bias.copy_(b.detach())
+
+    gn_layers = [gn1, gn2, gnref]
+    g1 = act_fn(gn1(xc))
+    g2 = gn2(x)
+    rand_dy = torch.rand_like(g2)
+    rand_dy /= rand_dy.numel() ** 0.5 # to prevent false positive errors from ocurring because of really large magnitude losses
+
+    err_params = False
+    gref = gref_dx = None
+    def vprint_err(x_ref, x_test, x_naive_fn, bwd=True, left_pad=0):
+        nonlocal gref, gref_dx
+        lpad = ' ' * left_pad
         with torch.no_grad():
-            w = torch.randn((C,), dtype=DTYPE)
-            b = torch.randn((C,), dtype=DTYPE)
-            gn1.weight.copy_(w.detach().float())
-            gn1.bias.copy_(b.detach().float())
-            gn2.weight.copy_(w.detach())
-            gn2.bias.copy_(b.detach())
-            gnref.weight.copy_(w.detach())
-            gnref.bias.copy_(b.detach())
+            err = F.mse_loss(x_ref, x_test)
 
-        gn_layers = [gn1, gn2, gnref]
-        g1 = act_fn(gn1(xc))
-        g2 = gn2(x)
-        rand_dy = torch.rand_like(g2)
-        rand_dy /= rand_dy.numel() ** 0.5 # to prevent false positive errors from ocurring because of really large magnitude losses
+        if err < ERRS[DTYPE]:
+            vprint(green(f'{lpad}Negligible difference (err: {err:.2e}) found'))
+        else:
+            if gref is None:
+                gref = act_fn(gnref(xc))
+            if bwd and gref_dx is None:
+                xc.grad = None
+                (gref * rand_dy).sum().backward()
+                gref_dx = xc.grad.clone()
 
-        ERRS = {
-            torch.bfloat16: 1e-6,
-            torch.float16: 1e-7,
-            torch.float: 1e-10,
-            torch.double: 1e-20,
-        }
-
-        err_params = False
-        gref = gref_dx = None
-        def vprint_err(x_ref, x_test, x_naive_fn, bwd=True, left_pad=0):
-            nonlocal gref, gref_dx
-            lpad = ' ' * left_pad
             with torch.no_grad():
-                err = F.mse_loss(x_ref, x_test)
+                x_naive = x_naive_fn()
+                err_ref_naive = F.mse_loss(x_ref, x_naive)
+                err_test_naive = F.mse_loss(x_test, x_naive)
 
-            if err < ERRS[DTYPE]:
-                vprint(green(f'{lpad}Negligible difference (err: {err:.2e}) found'))
+            if err_test_naive < err_ref_naive:
+                vprint(yellow(f'{lpad}Negligible difference (err: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}) found'))
             else:
-                if gref is None:
-                    gref = act_fn(gnref(xc))
-                if bwd and gref_dx is None:
-                    xc.grad = None
-                    (gref * rand_dy).sum().backward()
-                    gref_dx = xc.grad.clone()
+                vprint(red(f'{lpad}Error: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}'))
+                return True
+        return False
 
-                with torch.no_grad():
-                    x_naive = x_naive_fn()
-                    err_ref_naive = F.mse_loss(x_ref, x_naive)
-                    err_test_naive = F.mse_loss(x_test, x_naive)
+    vprint('  FORWARD')
+    err_params = vprint_err(g1, g2, lambda: gref, bwd=False, left_pad=4) or err_params
+    vprint('  BACKWARD')
+    xc.grad = None
+    (g1 * rand_dy).sum().backward()
+    g1_dx = xc.grad.clone()
 
-                if err_test_naive < err_ref_naive:
-                    vprint(yellow(f'{lpad}Negligible difference (err: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}) found'))
-                else:
-                    vprint(red(f'{lpad}Error: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}'))
-                    return True
-            return False
+    x.grad = None
+    (g2 * rand_dy).sum().backward()
+    g2_dx = x.grad.clone()
 
-        vprint('  FORWARD')
-        err_params = vprint_err(g1, g2, lambda: gref, bwd=False, left_pad=4) or err_params
-        vprint('  BACKWARD')
-        xc.grad = None
-        (g1 * rand_dy).sum().backward()
-        g1_dx = xc.grad.clone()
+    vprint('    wrt X')
+    err_params = vprint_err(g1_dx, g2_dx, lambda: gref_dx, left_pad=6) or err_params
+    vprint('    wrt weight')
+    err_params = vprint_err(gn1.weight.grad, gn2.weight.grad, lambda: gnref.weight.grad, left_pad=6) or err_params
+    vprint('    wrt bias')
+    err_params = vprint_err(gn1.bias.grad, gn2.bias.grad, lambda: gnref.bias.grad, left_pad=6) or err_params
 
-        x.grad = None
-        (g2 * rand_dy).sum().backward()
-        g2_dx = x.grad.clone()
+    return err_params
 
-        vprint('    wrt X')
-        err_params = vprint_err(g1_dx, g2_dx, lambda: gref_dx, left_pad=6) or err_params
-        vprint('    wrt weight')
-        err_params = vprint_err(gn1.weight.grad, gn2.weight.grad, lambda: gnref.weight.grad, left_pad=6) or err_params
-        vprint('    wrt bias')
-        err_params = vprint_err(gn1.bias.grad, gn2.bias.grad, lambda: gnref.bias.grad, left_pad=6) or err_params
+CUSTOM_INPUTS = [
+    ('silu', torch.double, 1,    1,   2,   2,    1),
+    ('silu', torch.double, 2, 3909,   5,   5,    3),
+    ('silu', torch.double, 1, 2062,   5,   5, 1031),
+    ('silu', torch.double, 3, 4096,   7,   7,    4),
+    ('silu', torch.double, 1, 4096,   7,   7,    4),
+    ('silu', torch.double, 2,  160,   8,   8,  160),
+    ('silu', torch.double, 1,    3,   7,   7,    1),
+    ('silu', torch.double, 1,    1,   4,   4,    1),
+    ('silu', torch.double, 1,  128,   8,   8,    8),
+    ('silu', torch.double, 2, 1280,   8,   8,   32),
+    ('silu', torch.double, 2,  640,  16,  16,   32),
+    ('silu', torch.double, 2, 2560,   8,   8,   32),
+    ('silu', torch.double, 2, 1280,  16,  16,   32),
+    ('silu', torch.double, 2,  320,  32,  32,   32),
+    ('silu', torch.double, 2, 1920,  16,  16,   32),
+    ('silu', torch.double, 2, 2560,  16,  16,   32),
+    ('silu', torch.double, 2,  640,  32,  32,   32),
+    ('silu', torch.double, 2,  960,  32,  32,   32),
+    ('silu', torch.double, 2, 1280,  32,  32,   32),
+    ('silu', torch.double, 2,  320,  64,  64,   32),
+    ('silu', torch.double, 2, 1920,  32,  32,   32),
+    ('silu', torch.double, 2,  640,  64,  64,   32),
+    ('silu', torch.double, 8,  128,  64,  64,   32),
+]
 
-        return err_params
-
-if __name__ == '__main__':
-    ACT_FN = 'silu'
-    act_fn = {
-        'identity': lambda x: x,
-        'silu': F.silu,
-        'relu': F.relu,
-        'gelu': F.gelu,
-        'gelu_tanh': lambda x: F.gelu(x, approximate='tanh'),
-    }[ACT_FN]
-
-    MODE = 'check' # can be 'check', 'bench', other modes do both
-    CHECK_PROF = len(sys.argv) > 1 and sys.argv[1] == '1'
-
+def brute_force():
+    ACT_FNS = ['silu']
+    DTYPES = [torch.float]
     Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
     Cs = (
         1, 2, 3, 4, 5, 6, 7, 32, 64, 128, 256, 512,
@@ -187,64 +207,45 @@ if __name__ == '__main__':
         1024,
     )
     Gs = (1, 2, 3, 4, 8, 16, 32,)
-    all_params = itertools.product([torch.float], Bs, Cs, Rs, Gs)
-
-    inputs = [
-        #(torch.double, 1, 1, 2, 1),
-
-        #(torch.double, 2, 3909, 5, 3),
-        #(torch.double, 1, 2062, 5, 1031),
-        #(torch.double, 3, 4096, 7, 4),
-        #(torch.double, 1, 4096, 7, 4),
-
-        #(torch.double, 2, 160, 8, 160),
-        #(torch.double, 1, 3, 7, 1),
-        #(torch.double, 1, 1, 4, 1),
-        #(torch.double, 1, 128, 8, 8),
-        #(torch.double, 2, 1280, 8, 32),
-        #(torch.double, 2, 640, 16, 32),
-        #(torch.double, 2, 2560, 8, 32),
-        #(torch.double, 2, 1280, 16, 32),
-        #(torch.double, 2, 320, 32, 32),
-        #(torch.double, 2, 1920, 16, 32),
-        #(torch.double, 2, 2560, 16, 32),
-        #(torch.double, 2, 640, 32, 32),
-        #(torch.double, 2, 960, 32, 32),
-        #(torch.double, 2, 1280, 32, 32),
-        #(torch.double, 2, 320, 64, 32),
-        #(torch.double, 2, 1920, 32, 32),
-        #(torch.double, 2, 640, 64, 32),
-        #(torch.float, 1, 64, 256, 32),
-        #(torch.float, 2, 64, 512, 32),
-        #(torch.double, 8, 128, 64, 32),
-        #(torch.half, 2, 128, 128, 32),
-        (torch.half, 2, 256, 128, 32),
-        #(torch.half, 2, 512, 128, 32),
-    ]
+    all_params = itertools.product(ACT_FNS, DTYPES, Bs, Cs, Rs, Rs, Gs)
     inputs = None
 
     err_inputs = filter(config_filter, all_params)
+    err_inputs = filter(lambda x: x[4] == x[5], err_inputs) # only allow inputs where H = W to reduce search space
+    return err_inputs
 
-    if inputs is None: # run on cartesian product of inputs
-        for DTYPE in [torch.float, torch.double]: # run tests on low-precision dtypes and rerunning failing tests on higher-precision dtypes to see if there's an actual problem in the code or just a precision error
-            inputs = [(DTYPE, *params[1:]) for params in err_inputs]
-            err_inputs = []
-            for params in tqdm(sorted(
-                inputs,
-                key = lambda x: x[1]*x[2]*x[3]*x[4]
-            )):
-                err_params = check_params(params)
-                if err_params:
-                    err_inputs.append(params)
-    else:
+def test_inputs(inputs, upcast_errors=True):
+    err_inputs = []
+    for params in tqdm(list(inputs)):
+        err_params = check_params(params)
+        if err_params:
+            err_inputs.append(params)
+    
+    if not upcast_errors:
+        return err_inputs
+
+    # retry the error inputs but with a higher precision to see if a large error was because of precision issues (or because of programmer error)
+    for UPCAST_DTYPE in [torch.float, torch.double]:
+        inputs = err_inputs[:]
         err_inputs = []
-        for params in tqdm(inputs):
+        for params in inputs:
+            ACT_FN, DTYPE, B, C, H, W, G = params
+            if torch.finfo(DTYPE).resolution >= torch.finfo(UPCAST_DTYPE).resolution: # only bother checking with the upcasted dtype if it has higher precision to the error-ed test case
+                continue
+            params = (ACT_FN, UPCAST_DTYPE, B, C, H, W, G)
             err_params = check_params(params)
             if err_params:
                 err_inputs.append(params)
 
+    return err_inputs
+
+if __name__ == '__main__':
+    #inputs = CUSTOM_INPUTS
+    inputs = brute_force()
+    err_inputs = test_inputs(inputs)
+
     if len(err_inputs) > 0:
         print(red('Error inputs found:'))
         print(err_inputs)
-    elif not CHECK_PROF:
+    else:
         print(green('No errors found :)'))
