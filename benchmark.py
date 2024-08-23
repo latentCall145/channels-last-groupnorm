@@ -4,8 +4,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
-import torch, datetime, time, os, itertools, sys
-torch.set_printoptions(sci_mode=False, edgeitems=1)
+import torch, datetime, time, os, itertools
 
 # make strings different colors
 def red(text): return '\033[91m' + str(text) + '\033[0m'
@@ -82,12 +81,12 @@ if __name__ == '__main__':
                         g.backward(grad)
                 torch.cuda.synchronize()
 
-                tic = time.time()
-                tic_sec = time.time()
+                tic = time.perf_counter()
+                tic_sec = time.perf_counter()
                 ntrials = ntrials_minor = 0
                 minor_speeds = [] # used to track speed percentiles since they can often vary by a lot
 
-                while time.time() - tic < NSEC:
+                while time.perf_counter() - tic < NSEC:
                     graph.replay()
                     #g = gn_layer(gn_input)
                     #if not isinstance(gn_layer, GN_NHWC):
@@ -99,15 +98,15 @@ if __name__ == '__main__':
                     ntrials += 1
                     ntrials_minor += 1
 
-                    if time.time() - tic_sec > 0.1:
-                        speed = round(ntrials_minor / (time.time() - tic_sec), 2)
+                    if time.perf_counter() - tic_sec > 0.1:
+                        speed = round(ntrials_minor / (time.perf_counter() - tic_sec), 2)
                         minor_speeds.append(speed)
 
                         bw1 = gn_input.numel() * (3+5 if INCLUDE_BWD else 3) * {torch.half:2,torch.bfloat16:2, torch.float:4,torch.double:8}[DTYPE]
-                        bw = ntrials * gn_input.nbytes * (3+5 if INCLUDE_BWD else 3) / (time.time() - tic)
-                        print(f'\t\tduration: {time.time() - tic:.1f}/{NSEC} seconds completed, bandwidth: {blue(round(bw / 1e9, 2))} GB/s, speed: {blue(speed)} it/s           \r', end='')
+                        bw = ntrials * gn_input.nbytes * (3+5 if INCLUDE_BWD else 3) / (time.perf_counter() - tic)
+                        print(f'\t\tduration: {time.perf_counter() - tic:.1f}/{NSEC} seconds completed, bandwidth: {blue(round(bw / 1e9, 2))} GB/s, speed: {blue(speed)} it/s           \r', end='')
                         ntrials_minor = 0
-                        tic_sec = time.time()
+                        tic_sec = time.perf_counter()
 
                 minor_speeds = np.array(minor_speeds)
                 median_speed = round(np.percentile(minor_speeds, 50), 2)
