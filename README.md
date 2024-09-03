@@ -44,4 +44,4 @@ To see your nvcc version: `nvcc -V`
 See your PyTorch CUDA version: `python3 -c "import torch; print(torch.version.cuda)"`
 
 ### Writeup
-I also wrote a writeup on the math behind the forward/backward pass for GN + fused activation. Check it out [here](https://drive.google.com/file/d/1c-FvwCT6FWw5eYI-MqyNc311mrnKV6un/view?usp=sharing)!
+I also wrote a writeup on the math behind the forward/backward pass for GN + fused activation. Check it out [here](https://latentcall145.github.io/gn-chronicles)!
