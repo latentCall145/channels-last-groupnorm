@@ -153,8 +153,9 @@ compute_stats_pt1(
         (TPB,) -view-> (d, G/f, D) -permute-> (d, D, G/f) -reduce-> G/f
         output buffer: (N, G, H)
       else (e.g. f/G > 1 aka more than one thread-block reduces one group)
+        snap constraints require that D % TPB = 0 in this case so f/G = CDIV(f, G)
         (TPB,) -view-> (1, 1, D) -permute-> (1, D, 1) -reduce-> 1
-        output buffer: (N, f, H)
+        output buffer: (N, f*CDIV(G/f), H) = (N, f, H)
   */
   using T_ACC = typename acc_type<T>::type;
   using WelfordType = WelfordData<T_ACC, INT>;
@@ -207,26 +208,23 @@ compute_stats_pt1(
   }
 
   // put reduced outputs into return buffers
-  /*
-     if gf == 1 -> tid < 1
-     if gf > 1 -> tid < G - bz*gf
-     */
   const int fgf = (gf > 1) ? G : f;
-  if (!(gf == 1 && tid == 0) && (tid >= MIN(gf, G - (int)blockIdx.z * gf))) return; // TODO: make less confusing
+  const int fgf_idx = blockIdx.z * gf + gf_idx;
+  if (fgf_idx >= fgf) return;
   int out_idx = 0;
   out_idx += blockIdx.x * fgf * H;
-  out_idx += blockIdx.z * gf * H;
-  out_idx += tid * H;
+  out_idx += fgf_idx * H;
   out_idx += blockIdx.y;
-  welford_data[out_idx] = vals_reduced[tid];
+  welford_data[out_idx] = vals_reduced[gf_idx];
 }
 
 template <typename T>
 __global__ void
 compute_stats_pt2(
     WelfordData<typename acc_type<T>::type, INT> *welford_data,
-    const int R,
+    const int H,
     const int G,
+    const int fg,
     const T eps,
     T *means,
     T *rstds) {
@@ -236,20 +234,21 @@ compute_stats_pt2(
   /*
     Computes means and rstds of X on the H (height) dimension.
     grid: (x=N, y=G); block: (x=TPB)
-    - l = (f * ceil(G/f) / G) * H / TPB (l = number of times to loop a block to reduce the H dimension)
+    - l = ceil(f/G) * H / TPB (l = number of times to loop a block to reduce the H dimension as well as any partially reduced group sections)
     if G/f (from compute_stats_pt1) > 1
       welford_data shape: (N, G, H) -view-> (N, G, f, H/f); X stride: (GH, H, H/f, 1)
     else (i.e. f/G > 1)
       welford_data shape: (N, f, H) -view-> (N, G, f/G, H/f); X stride: (GH*gf, gf*H, gf*H/f, 1)
-    dram reduction (per block): (f, gf*H/f) -reduce-> (gf*H/f,)
-    shmem reduction (per block): (gf*H/f) -reduce-> (1,)
+    dram reduction (per block): (CDIV(fg*H, TPB), TPB) -reduce-> (TPB,)
+    shmem reduction (per block): (TPB,) -reduce-> (1,)
     output buffer: (N, G)
   */
 
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
   WelfordType val(0, 0, 0, 0);
-  const int TPB = blockDim.y * blockDim.x;
+  const int TPB = blockDim.x;
 
+  const int R = fg * H; // R for num "R"educe elements per block
   const int l = CDIV(R, TPB);
   for (int i = 0; i < l; ++i) {
     int r = i * TPB + threadIdx.x;
@@ -430,7 +429,7 @@ void run_gn_fwd_kernels(
   const int W = R / H;
   auto [TPB, d, f1] = calc_block_params(W * C, C, C / G);
   const int gf = CDIV(G, f1); // number of groups processed per block in compute_stats_pt1, needed here because it determines size of welford_data
-  const int fgf = (gf == 1) ? f1 : G; // f1 * gf but in case gf > 1, return G (e.g. G=1031, f1=6, gf=172, f1*gf=1032 != 1031)
+  const int fgf = (gf == 1) ? f1 : G; // f1 * gf but in case gf > 1, return G (e.g. G=1031, f1=6, gf=172, f1*gf=1032 != 1031; if fgf > G, we know for certain it is because each group needs multiple blocks)
   WelfordType *welford_data = (WelfordType*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(WelfordType) * N * fgf * H);
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
   
@@ -447,12 +446,12 @@ void run_gn_fwd_kernels(
 
   // compute means/rstds over height dimension
   {
-    int group_mult = gf * f1 / G;
-    auto [TPB, d, f] = calc_block_params(group_mult * H, group_mult * H);
+    const int fg = CDIV(f1, G); // number of blocks to process one group
+    auto [TPB, d, f] = calc_block_params(fg * H, fg * H);
     DEBUG("starting compute_stats 2, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, d: %d, f: %d, gf: %d, group_mult: %d\n", N, H, W, C, G, (C / G), TPB, d, f, gf, group_mult);
     compute_stats_pt2<<<dim3(N, G), TPB, 0, cuda_stream>>>(
         welford_data,
-        group_mult * H, G, eps,
+        H, G, fg, eps,
         mean_data, rstd_data
     );
   }
@@ -596,7 +595,8 @@ width_reduce(
   }
 
   // put reduced outputs into return buffers
-  if (tid >= MIN(C, C - (int)blockIdx.z*TPB)) return; // TODO: confusing code
+  if (threadIdx.y != 0) return; 
+  // at this point ty = 0 and c < C -> maximum of C threads/block reaching past this point (fewer threads if f > 1)
   int out_idx = 0;
   out_idx += n * C * H;
   out_idx += c * H;
