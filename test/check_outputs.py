@@ -1,10 +1,10 @@
+# Exhaustive search to check if GN outputs are equal to reference.
 from gnnhwc import GN_NHWC
 from tqdm import tqdm
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 import torch, datetime, time, os, itertools, sys
-torch.set_printoptions(sci_mode=False, edgeitems=1)
 
 class GN_Naive(nn.Module):
     def __init__(self, num_groups: int, nc: int, **kwargs):
@@ -82,7 +82,7 @@ ERRS = {
 }
 
 bigx = None
-def check_params(params, verbose=False):
+def check_params(params, verbose=True):
     global bigx
     if bigx is None:
         bigx = torch.randn(128*1024*1024)
@@ -96,6 +96,7 @@ def check_params(params, verbose=False):
     torch.random.manual_seed(0)
 
     gn2 = GN_NHWC(G, C, activation=ACT_FN).cuda().to(DTYPE)
+    #gn2 = nn.GroupNorm(G, C).cuda().to(DTYPE)
 
     gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
     act_fn = get_act_fn(ACT_FN)
@@ -131,7 +132,7 @@ def check_params(params, verbose=False):
                 gref = act_fn(gnref(xc))
             if bwd and gref_dx is None:
                 xc.grad = None
-                (gref * rand_dy).sum().backward()
+                gref.backward(rand_dy)
                 gref_dx = xc.grad.clone()
 
             with torch.no_grad():
@@ -150,11 +151,11 @@ def check_params(params, verbose=False):
     err_params = vprint_err(g1, g2, lambda: gref, bwd=False, left_pad=4) or err_params
     vprint('  BACKWARD')
     xc.grad = None
-    (g1 * rand_dy).sum().backward()
+    g1.backward(rand_dy)
     g1_dx = xc.grad.clone()
 
     x.grad = None
-    (g2 * rand_dy).sum().backward()
+    g2.backward(rand_dy)
     g2_dx = x.grad.clone()
 
     vprint('    wrt X')
@@ -167,33 +168,33 @@ def check_params(params, verbose=False):
     return err_params
 
 CUSTOM_INPUTS = [
-    ('silu', torch.double, 1,    1,   2,   2,    1),
-    ('silu', torch.double, 2, 3909,   5,   5,    3),
-    ('silu', torch.double, 1, 2062,   5,   5, 1031),
-    ('silu', torch.double, 3, 4096,   7,   7,    4),
-    ('silu', torch.double, 1, 4096,   7,   7,    4),
-    ('silu', torch.double, 2,  160,   8,   8,  160),
-    ('silu', torch.double, 1,    3,   7,   7,    1),
-    ('silu', torch.double, 1,    1,   4,   4,    1),
-    ('silu', torch.double, 1,  128,   8,   8,    8),
-    ('silu', torch.double, 2, 1280,   8,   8,   32),
-    ('silu', torch.double, 2,  640,  16,  16,   32),
-    ('silu', torch.double, 2, 2560,   8,   8,   32),
-    ('silu', torch.double, 2, 1280,  16,  16,   32),
-    ('silu', torch.double, 2,  320,  32,  32,   32),
-    ('silu', torch.double, 2, 1920,  16,  16,   32),
-    ('silu', torch.double, 2, 2560,  16,  16,   32),
-    ('silu', torch.double, 2,  640,  32,  32,   32),
-    ('silu', torch.double, 2,  960,  32,  32,   32),
-    ('silu', torch.double, 2, 1280,  32,  32,   32),
-    ('silu', torch.double, 2,  320,  64,  64,   32),
-    ('silu', torch.double, 2, 1920,  32,  32,   32),
-    ('silu', torch.double, 2,  640,  64,  64,   32),
-    ('silu', torch.double, 8,  128,  64,  64,   32),
+    ('identity', torch.double, 1,    1,   2,   2,    1),
+    ('identity', torch.double, 2, 3909,   5,   5,    3),
+    ('identity', torch.double, 1, 2062,   5,   5, 1031),
+    ('identity', torch.double, 3, 4096,   7,   7,    4),
+    ('identity', torch.double, 1, 4096,   7,   7,    4),
+    ('identity', torch.double, 2,  160,   8,   8,  160),
+    ('identity', torch.double, 1,    3,   7,   7,    1),
+    ('identity', torch.double, 1,    1,   4,   4,    1),
+    ('identity', torch.double, 1,  128,   8,   8,    8),
+    ('identity', torch.double, 2, 1280,   8,   8,   32),
+    ('identity', torch.double, 2,  640,  16,  16,   32),
+    ('identity', torch.double, 2, 2560,   8,   8,   32),
+    ('identity', torch.double, 2, 1280,  16,  16,   32),
+    ('identity', torch.double, 2,  320,  32,  32,   32),
+    ('identity', torch.double, 2, 1920,  16,  16,   32),
+    ('identity', torch.double, 2, 2560,  16,  16,   32),
+    ('identity', torch.double, 2,  640,  32,  32,   32),
+    ('identity', torch.double, 2,  960,  32,  32,   32),
+    ('identity', torch.double, 2, 1280,  32,  32,   32),
+    ('identity', torch.double, 2,  320,  64,  64,   32),
+    ('identity', torch.double, 2, 1920,  32,  32,   32),
+    ('identity', torch.double, 2,  640,  64,  64,   32),
+    ('identity', torch.double, 8,  128,  64,  64,   32),
 ]
 
 def brute_force():
-    ACT_FNS = ['silu']
+    ACT_FNS = ['identity']
     DTYPES = [torch.float]
     Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
     Cs = (
@@ -228,9 +229,10 @@ def test_inputs(inputs, upcast_errors=True):
     for UPCAST_DTYPE in [torch.float, torch.double]:
         inputs = err_inputs[:]
         err_inputs = []
-        for params in inputs:
+        for params in tqdm(inputs):
             ACT_FN, DTYPE, B, C, H, W, G = params
-            if torch.finfo(DTYPE).resolution >= torch.finfo(UPCAST_DTYPE).resolution: # only bother checking with the upcasted dtype if it has higher precision to the error-ed test case
+            if torch.finfo(DTYPE).resolution <= torch.finfo(UPCAST_DTYPE).resolution: # only bother checking with the upcasted dtype if it has higher precision to the error-ed test case
+                err_inputs.append(params)
                 continue
             params = (ACT_FN, UPCAST_DTYPE, B, C, H, W, G)
             err_params = check_params(params)
@@ -240,7 +242,8 @@ def test_inputs(inputs, upcast_errors=True):
     return err_inputs
 
 if __name__ == '__main__':
-    #inputs = CUSTOM_INPUTS
+    torch.set_printoptions(sci_mode=False, edgeitems=1)
+    inputs = CUSTOM_INPUTS
     inputs = brute_force()
     err_inputs = test_inputs(inputs)
 
