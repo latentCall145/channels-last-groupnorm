@@ -58,6 +58,7 @@ if __name__ == '__main__':
     
     configs = list(filter(config_filter, itertools.product(DTYPES, BATCHES, CHANNELS, RESOLUTIONS, NUM_GROUPS)))
     print('Estimated time (seconds) to complete:', NSEC * len(configs) * len(GN_KERNELS))
+    print(f'Activation fn: {ACT_FN}')
     print(f'Include bwd pass: {INCLUDE_BWD}')
 
     for DTYPE, B, C, R, G in configs:
@@ -75,21 +76,23 @@ if __name__ == '__main__':
             try:
                 gn_layer = gn_class(G, C).to(DTYPE).cuda()
 
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph): # using CUDA graphs to reduce CPU overhead
-                    g = gn_layer(gn_input)
-                    if not isinstance(gn_layer, GN_NHWC):
-                        g = act_fn(g)
-                    if INCLUDE_BWD:
-                        torch.autograd.grad(g, gn_input, grad_outputs=grad, retain_graph=True)
-                torch.cuda.synchronize()
+                # warmup iter
+                g = gn_layer(gn_input)
+                if not isinstance(gn_layer, GN_NHWC):
+                    g = act_fn(g)
+                if INCLUDE_BWD:
+                    torch.autograd.grad(g, gn_input, grad_outputs=grad, retain_graph=True)
 
                 tic = time.perf_counter()
                 tic_sec = time.perf_counter()
                 ntrials = 0
 
                 while time.perf_counter() - tic < NSEC:
-                    graph.replay()
+                    g = gn_layer(gn_input)
+                    if not isinstance(gn_layer, GN_NHWC):
+                        g = act_fn(g)
+                    if INCLUDE_BWD:
+                        torch.autograd.grad(g, gn_input, grad_outputs=grad, retain_graph=True)
                     torch.cuda.synchronize()
                     ntrials += 1
 
