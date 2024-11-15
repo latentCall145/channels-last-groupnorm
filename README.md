@@ -25,7 +25,7 @@ GN_NHWC(32, 128, activation='gelu_tanh') # replaces nn.GroupNorm(32, 128) and nn
 ## Performance
 On a RTX 3060 Max-Q, this implementation runs significantly faster than PyTorch's GroupNorm implementation over a wide range of batch sizes, resolutions, and channel counts. This implementation is about 50% faster than stable-fast's Triton NHWC GroupNorm implementation, with stable-fast's Stable Diffusion demo running 0.5-1% faster end-to-end using my GN kernel compared to its Triton GN kernel (tested using SD1.5 @ 512x512 res, bs=1 on a RTX 3060 Max-Q, SDXL @ 1024x1024 res, bs=1 on an A100 80 GB). In conjunction with NHWC convolution, I get around a 35% end-to-end speedup using my fused GN kernel.
 
-The CUDA kernels also compile about 5x faster than PyTorch's native GN CUDA kernels (from ~50 seconds to ~10 seconds) on my laptop (Intel i7-12700H @ 2.7 GHz CPU) as I removed many torch header files which slowed down compilation time.
+The CUDA kernels also compile about 5x faster than PyTorch's native GN CUDA kernels (from ~100 seconds to ~20 seconds) on my laptop (Intel i7-12700H @ 2.7 GHz CPU) as I removed many torch header files which slowed down compilation time.
 
 ## Todo
 - [x] Working forward kernel for all size inputs 
