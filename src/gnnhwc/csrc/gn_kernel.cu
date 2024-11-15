@@ -227,9 +227,9 @@ template <typename T>
 __global__ void
 compute_stats_pt2(
     WelfordData<typename acc_type<T>::type, INT> *welford_data,
-    const int H,
     const int G,
-    const int partials_per_group,
+    const int R,
+    const int l,
     const T eps,
     T *means,
     T *rstds) {
@@ -240,6 +240,7 @@ compute_stats_pt2(
     Computes means and rstds of X on the H (height) dimension.
     grid: (x=N, y=G); block: (x=TPB)
     - partials_per_group = number of thread-blocks in compute_stats1 needed to reduce a single group; equal to the number of elements per group per row that will be reduced into a single element
+    - R = partials_per_group * H (R = number of reduced elements per block)
     - l = partials_per_group * H / TPB (l = number of times to loop a block to reduce the H dimension as well as any partially reduced group sections)
     if blocks_per_group = 1 (i.e. partial_groups = G)
       welford_data shape: (N, G, H) -view-> (N, G, H/TPB, TPB); X stride: (GH, H, TPB, 1)
@@ -254,8 +255,6 @@ compute_stats_pt2(
   WelfordType val(0, 0, 0, 0);
   const int TPB = blockDim.x;
 
-  const int R = partials_per_group * H; // R for num "R"educe elements per block
-  const int l = CDIV(R, TPB);
   for (int i = 0; i < l; ++i) {
     int r = i * TPB + threadIdx.x;
     if (r >= R) continue;
@@ -482,14 +481,14 @@ void run_gn_fwd_kernels(
 
   // compute means/rstds over height dimension
   {
-    //const int partials_per_group = CDIV(blocks_per_row, G); // number of blocks to process one group
     const int partials_per_group = partial_groups / G; // number of blocks to process one group
-    //auto [TPB, rows_per_block, blocks_per_row] = calc_block_params(fg * H, fg * H);
     auto [TPB, rows_per_block, blocks_per_row] = calc_block_params(partials_per_group * H, partials_per_group * H);
+    const int R = partials_per_group * H; // R for num "R"educe elements per block
+    const int l = CDIV(R, TPB);
     DEBUG("starting compute_stats 2, N: %d, H: %d, W: %d, C: %d, G: %d, D: %d, TPB: %d, rows_per_block: %d, blocks_per_row: %d, groups_per_block: %d\n", N, H, W, C, G, (C / G), TPB, rows_per_block, blocks_per_row, groups_per_block);
     compute_stats_pt2<<<dim3(N, G), TPB, 0, cuda_stream>>>(
         welford_data,
-        H, G, partials_per_group, eps,
+        G, R, l, eps,
         mean_data, rstd_data
     );
   }
@@ -568,6 +567,7 @@ width_reduce(
     const int W,
     const int C,
     const int G,
+    const int w_loops,
     typename acc_type<T>::type *xdy_dy_sum_data) {
   /*
     Loops over W (width) dimension, loading and summing dy, X, and the activation derivative of Y. Outputs stored in xdy_dy_sum_data. Spatial dimension H is processed in a separate kernel.
@@ -601,7 +601,7 @@ width_reduce(
   T_ACC fused_scale = rstd_data[ng] * weight_data[c];
   T_ACC fused_bias = -mean_data[ng] * fused_scale + bias_data[c];
 
-  for (int i = 0; i < CDIV(W, rows_per_block); ++i) {
+  for (int i = 0; i < w_loops; ++i) {
     int w = i * rows_per_block + threadIdx.y;
     if (w >= W) continue; // handle overflowing indices
     int reduce_idx = 0;
@@ -651,10 +651,12 @@ height_reduce(
     T *xdy_dy_sum_data, // no need to specify T_ACC as T is already an accumulation type
     const int H,
     const int C,
+    const int l,
     T *xdy_sum_data,
     T *dy_sum_data) {
   /*
     Same thing as width_reduce but over the H (height) instead of the width dimension.
+    - l = CDIV(2H, TPB) (computed on CPU for speed); number of loops for DRAM reduction
     grid: (x=N, y=C); block: (x=2H/blocks_per_row)
     X shape: (N, C, H, 2) -view-> (N, C, blocks_per_row, H/blocks_per_row, 2); X stride: (2CH, 2H, 2H/blocks_per_row, H/blocks_per_row, 1)
     dram reduction (per block): (blocks_per_row, H/blocks_per_row, 2) -reduce-> (H/blocks_per_row, 2)
@@ -669,7 +671,7 @@ height_reduce(
   T *vals_reduced = reinterpret_cast<T*>(vals_reduced_uncasted);
 
   T sum = 0;
-  for (int i = 0; i < CDIV(2 * H, TPB); ++i) {
+  for (int i = 0; i < l; ++i) {
     const int h = i * TPB + tid;
     if (h >= 2 * H) continue;
     int idx = 0;
@@ -700,6 +702,7 @@ compute_dweight_dbias(
     const int N,
     const int C,
     const int G,
+    const int D,
     T *dweight_data,
     T *dbias_data) {
   /*
@@ -710,7 +713,6 @@ compute_dweight_dbias(
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (c >= C) return;
-  const int D = C / G;
   const int g = c / D;
   T_ACC sum1 = 0;
   T_ACC sum2 = 0;
@@ -737,6 +739,7 @@ compute_bwd_scale_biases(
     const int R,
     const int C,
     const int G,
+    const int D,
     typename acc_type<T>::type *fused_scale_data,
     typename acc_type<T>::type *fused_bias_data,
     typename acc_type<T>::type *coef1_data,
@@ -757,7 +760,6 @@ compute_bwd_scale_biases(
       coef1/2: (N, G)
    */
   using T_ACC = typename acc_type<T>::type;
-  const int D = C / G;
   const int TPB = blockDim.x;
   const int blocks_per_row = CDIV(D, TPB);
   const int n = blockIdx.x;
@@ -807,10 +809,10 @@ dx_elem_kernel(
     typename acc_type<T>::type *fused_bias_data,
     typename acc_type<T>::type *coef1_data,
     typename acc_type<T>::type *coef2_data,
-    const int N,
     const int R,
     const int C,
     const int G,
+    const int blocks_per_elem,
     T *dx_data) {
   /*
     Performs elementwise kernel to calculate gradients wrt X. Vectorized for speed.
@@ -819,6 +821,7 @@ dx_elem_kernel(
     grid: (x=N, y=HW/LOOP_I, y=blocks_per_row), block: (x=TPB)
     - C' = C / vec_elems
     - blocks_per_row = cdiv(C', TPB) (e.g. blocks_per_row*TPB ~ C')
+    - blocks_per_elem = gridDim.x / N (computed on CPU for speed)
     - note: the grid is actually (x=NR/LOOP_I/rows_per_block, y=1, z=blocks_per_row) since y/z max block size is 65K which causes issues for N=1, R=1024*1024, C=256
     if rows_per_block > 1:
       X shape: (N, R, C') -view-> (N, R/LOOP_I/rows_per_block, LOOP_I, rows_per_block, 1, C');   X.stride: (RC', LOOP_I*rows_per_block*C', TPB, C', C', 1)
@@ -829,7 +832,6 @@ dx_elem_kernel(
   using V = float_vec<T, vec_elems>;
   using V_ACC = float_vec<T_ACC, vec_elems>;
   const int Cp = C / vec_elems;
-  const int blocks_per_elem = gridDim.x / N;
   const int rows_per_block = blockDim.y;
   const int n = blockIdx.x / blocks_per_elem;
   const int by = blockIdx.x % blocks_per_elem; // hacky way to simulate blockIdx.y since blockDim.y is limited to 65K
@@ -905,16 +907,17 @@ dx_elem_kernel(
 // dx_elem2 and dx_elem are helper fns that define the template args of dx_elem_kernel
 template <typename T, int vec_elems> void dx_elem2(dim3 grid_dim, dim3 block_dim, int act_fn_option, const T *dy_data, const T *X_data, typename acc_type<T>::type *fused_scale_data, typename acc_type<T>::type *fused_bias_data, typename acc_type<T>::type *coef1_data, typename acc_type<T>::type *coef2_data, const int N, const int R, const int C, const int G, T *dx_data) {
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
+  const int blocks_per_elem = grid_dim.x / N;
   if (act_fn_option == 0)
-    dx_elem_kernel<T, vec_elems, identity_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, dx_data);
+    dx_elem_kernel<T, vec_elems, identity_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, R, C, G, blocks_per_elem, dx_data);
   else if (act_fn_option == 1)
-    dx_elem_kernel<T, vec_elems, relu_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, dx_data);
+    dx_elem_kernel<T, vec_elems, relu_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, R, C, G, blocks_per_elem, dx_data);
   else if (act_fn_option == 2)
-    dx_elem_kernel<T, vec_elems, silu_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, dx_data);
+    dx_elem_kernel<T, vec_elems, silu_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, R, C, G, blocks_per_elem, dx_data);
   if (act_fn_option == 3)
-    dx_elem_kernel<T, vec_elems, gelu_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, dx_data);
+    dx_elem_kernel<T, vec_elems, gelu_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, R, C, G, blocks_per_elem, dx_data);
   if (act_fn_option == 4)
-    dx_elem_kernel<T, vec_elems, gelu_tanh_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, N, R, C, G, dx_data);
+    dx_elem_kernel<T, vec_elems, gelu_tanh_d><<<grid_dim, block_dim, 0, cuda_stream>>>(dy_data, X_data, fused_scale_data, fused_bias_data, coef1_data, coef2_data, R, C, G, blocks_per_elem, dx_data);
 }
 
 template <typename T> void dx_elem(dim3 grid_dim, dim3 block_dim, int vec_elems, int act_fn_option, const T *dy_data, const T *X_data, typename acc_type<T>::type *fused_scale_data, typename acc_type<T>::type *fused_bias_data, typename acc_type<T>::type *coef1_data, typename acc_type<T>::type *coef2_data, const int N, const int R, const int C, const int G, T *dx_data) {
@@ -954,16 +957,17 @@ void run_gn_bwd_kernels(
   {
     auto [TPB, rows_per_block, blocks_per_row] = calc_block_params(W * C, C);
     DEBUG("starting width reduce, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, rows_per_block: %d, blocks_per_row: %d\n", N, H, W, C, G, TPB, rows_per_block, blocks_per_row);
+    const int w_loops = CDIV(W, rows_per_block);
     if (act_fn_option == 0)
-      width_reduce<T, identity_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, xdy_dy_sum_data);
+      width_reduce<T, identity_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, w_loops, xdy_dy_sum_data);
     else if (act_fn_option == 1)
-      width_reduce<T, relu_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, xdy_dy_sum_data);
+      width_reduce<T, relu_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, w_loops, xdy_dy_sum_data);
     else if (act_fn_option == 2)
-      width_reduce<T, silu_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, xdy_dy_sum_data);
+      width_reduce<T, silu_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, w_loops, xdy_dy_sum_data);
     else if (act_fn_option == 3)
-      width_reduce<T, gelu_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, xdy_dy_sum_data);
+      width_reduce<T, gelu_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, w_loops, xdy_dy_sum_data);
     else if (act_fn_option == 4)
-      width_reduce<T, gelu_tanh_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, xdy_dy_sum_data);
+      width_reduce<T, gelu_tanh_d><<<dim3(N, H, blocks_per_row), dim3(TPB / rows_per_block, rows_per_block), sizeof(T_ACC) * 2*TPB, cuda_stream>>>(dy_data, X_data, mean_data, rstd_data, weight_data, bias_data, H, W, C, G, w_loops, xdy_dy_sum_data);
   }
 
   T_ACC* xdy_sum_data = (T_ACC*)c10::cuda::CUDACachingAllocator::raw_alloc(sizeof(T_ACC) * N * C);
@@ -972,9 +976,10 @@ void run_gn_bwd_kernels(
   {
     auto [TPB, rows_per_block, blocks_per_row] = calc_block_params(2 * H, 2);
     DEBUG("starting height reduce, N: %d, H: %d, W: %d, C: %d, G: %d, TPB: %d, rows_per_block: %d, blocks_per_row: %d\n", N, H, W, C, G, TPB, rows_per_block, blocks_per_row);
+    const int l = CDIV(2 * H, TPB);
     height_reduce<<<dim3(N, C), TPB, sizeof(T_ACC) * TPB, cuda_stream>>>(
         xdy_dy_sum_data,
-        H, C,
+        H, C, l,
         xdy_sum_data, dy_sum_data);
   }
   c10::cuda::CUDACachingAllocator::raw_delete(xdy_dy_sum_data);
@@ -986,7 +991,7 @@ void run_gn_bwd_kernels(
     compute_dweight_dbias<<<blocks_per_row, TPB, 0, cuda_stream>>>(
         mean_data, rstd_data,
         xdy_sum_data, dy_sum_data,
-        N, C, G,
+        N, C, G, D,
         dweight_data, dbias_data);
   }
 
@@ -1002,7 +1007,7 @@ void run_gn_bwd_kernels(
     compute_bwd_scale_biases<<<dim3(N, G), TPB, sizeof(T_ACC) * 2*TPB, cuda_stream>>>(
         mean_data, rstd_data, weight_data, bias_data,
         xdy_sum_data, dy_sum_data,
-        R, C, G,
+        R, C, G, D,
         fused_scale_data, fused_bias_data, coef1_data, coef2_data);
   }
 
