@@ -21,7 +21,7 @@ class GN_Naive(nn.Module):
     def forward(self, x):
         N, C, H, W = x.shape
         self.x = x
-        xr = x.view(N, self.G, H*W*C//self.G)
+        xr = x.reshape(N, self.G, H*W*C//self.G)
         means = xr.mean(dim=2, keepdim=True)
         rstds = torch.rsqrt(xr.var(dim=2, correction=0, keepdim=True) + self.eps)
         self.means = means[:, :, 0]
@@ -74,18 +74,8 @@ def config_filter(x): # returns true if config is valid
         return False
     return True
 
-ERRS = {
-    torch.bfloat16: 1e-6,
-    torch.float16: 1e-7,
-    torch.float: 1e-10,
-    torch.double: 1e-20,
-}
-
-bigx = None
+bigx = torch.randn(128*1024*1024)
 def check_params(params, verbose=True):
-    global bigx
-    if bigx is None:
-        bigx = torch.randn(128*1024*1024)
     vprint = lambda *args, **kwargs: print(*args, **kwargs) if verbose else None
     ACT_FN, DTYPE, B, C, H, W, G = params
     vprint(blue(f'output testing | ACT_FN: {ACT_FN} | DTYPE: {DTYPE} |B: {B:<2} | C: {C:<4} | H: {H:<4} | W: {W:<4} | G: {G:<3}'))
@@ -95,75 +85,76 @@ def check_params(params, verbose=True):
     x.requires_grad_(True)
     torch.random.manual_seed(0)
 
-    gn2 = GN_NHWC(G, C, activation=ACT_FN).cuda().to(DTYPE)
-    #gn2 = nn.GroupNorm(G, C).cuda().to(DTYPE)
+    gn_test = GN_NHWC(G, C, activation=ACT_FN).cuda().to(DTYPE)
+    #gn_test = nn.GroupNorm(G, C).cuda().to(DTYPE)
 
-    gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
+    gn_ref = nn.GroupNorm(G, C).cuda().to(DTYPE)
     act_fn = get_act_fn(ACT_FN)
-    gnref = GN_Naive(G, C).cuda().to(DTYPE)
+    gn_naive = GN_Naive(G, C).cuda().to(DTYPE)
     with torch.no_grad(): # copy weights
         w = torch.randn((C,), dtype=DTYPE)
         b = torch.randn((C,), dtype=DTYPE)
-        gn1.weight.copy_(w.detach().float())
-        gn1.bias.copy_(b.detach().float())
-        gn2.weight.copy_(w.detach())
-        gn2.bias.copy_(b.detach())
-        gnref.weight.copy_(w.detach())
-        gnref.bias.copy_(b.detach())
+        gn_ref.weight.copy_(w.detach())
+        gn_ref.bias.copy_(b.detach())
+        gn_test.weight.copy_(w.detach())
+        gn_test.bias.copy_(b.detach())
+        gn_naive.weight.copy_(w.detach())
+        gn_naive.bias.copy_(b.detach())
 
-    gn_layers = [gn1, gn2, gnref]
-    g1 = act_fn(gn1(xc))
-    g2 = gn2(x)
-    rand_dy = torch.rand_like(g2)
+    g_ref = act_fn(gn_ref(xc))
+    g_test = gn_test(x)
+    rand_dy = bigx[-B*C*H*W:].reshape((B, C, H, W)).to(DTYPE).cuda()
     rand_dy /= rand_dy.numel() ** 0.5 # to prevent false positive errors from ocurring because of really large magnitude losses
 
     err_params = False
-    gref = gref_dx = None
+    g_naive = g_naive_dx = None
     def vprint_err(x_ref, x_test, x_naive_fn, bwd=True, left_pad=0):
-        nonlocal gref, gref_dx
+        nonlocal g_naive, g_naive_dx
         lpad = ' ' * left_pad
         with torch.no_grad():
-            err = F.mse_loss(x_ref, x_test)
+            err = (x_ref - x_test).abs().max()
 
-        if err < ERRS[DTYPE]:
+        if err < 10 * torch.finfo(DTYPE).resolution:
             vprint(green(f'{lpad}Negligible difference (err: {err:.2e}) found'))
+            return False
+
+        # second stage check: check both torch's GN and custom GN against a naive implementation to see if the error could be caused by rounding errors
+        if g_naive is None:
+            g_naive = act_fn(gn_naive(xc))
+        if bwd and g_naive_dx is None:
+            xc.grad = None
+            g_naive.backward(rand_dy)
+            g_naive_dx = xc.grad
+
+        with torch.no_grad():
+            x_naive = x_naive_fn() # we use a function because the variable that may be referred to may not be initialized until the function is called, acts similar to a reference/pointer in java/c
+            err_ref_naive = (x_ref - x_naive).abs().max()
+            err_test_naive = (x_test - x_naive).abs().max()
+
+        if err_test_naive < 2 * err_ref_naive:
+            vprint(yellow(f'{lpad}Negligible difference (err: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}) found'))
+            return False
         else:
-            if gref is None:
-                gref = act_fn(gnref(xc))
-            if bwd and gref_dx is None:
-                xc.grad = None
-                gref.backward(rand_dy)
-                gref_dx = xc.grad.clone()
-
-            with torch.no_grad():
-                x_naive = x_naive_fn()
-                err_ref_naive = F.mse_loss(x_ref, x_naive)
-                err_test_naive = F.mse_loss(x_test, x_naive)
-
-            if err_test_naive < err_ref_naive:
-                vprint(yellow(f'{lpad}Negligible difference (err: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}) found'))
-            else:
-                vprint(red(f'{lpad}Error: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}'))
-                return True
-        return False
+            vprint(red(f'{lpad}Error: {err:.2e}, test-naive: {err_test_naive:.2e}, ref-naive: {err_ref_naive:.2e}'))
+            return True
 
     vprint('  FORWARD')
-    err_params = vprint_err(g1, g2, lambda: gref, bwd=False, left_pad=4) or err_params
+    err_params = vprint_err(g_ref, g_test, lambda: g_ref, bwd=False, left_pad=4) or err_params
     vprint('  BACKWARD')
     xc.grad = None
-    g1.backward(rand_dy)
-    g1_dx = xc.grad.clone()
+    g_ref.backward(rand_dy)
+    g_ref_dx = xc.grad
 
     x.grad = None
-    g2.backward(rand_dy)
-    g2_dx = x.grad.clone()
+    g_test.backward(rand_dy)
+    g_test_dx = x.grad
 
     vprint('    wrt X')
-    err_params = vprint_err(g1_dx, g2_dx, lambda: gref_dx, left_pad=6) or err_params
+    err_params = vprint_err(g_ref_dx, g_test_dx, lambda: g_naive_dx, left_pad=6) or err_params
     vprint('    wrt weight')
-    err_params = vprint_err(gn1.weight.grad, gn2.weight.grad, lambda: gnref.weight.grad, left_pad=6) or err_params
+    err_params = vprint_err(gn_ref.weight.grad, gn_test.weight.grad, lambda: gn_naive.weight.grad, left_pad=6) or err_params
     vprint('    wrt bias')
-    err_params = vprint_err(gn1.bias.grad, gn2.bias.grad, lambda: gnref.bias.grad, left_pad=6) or err_params
+    err_params = vprint_err(gn_ref.bias.grad, gn_test.bias.grad, lambda: gn_naive.bias.grad, left_pad=6) or err_params
 
     return err_params
 
@@ -193,9 +184,13 @@ CUSTOM_INPUTS = [
     ('identity', torch.double, 8,  128,  64,  64,   32),
 ]
 
+CUSTOM_INPUTS = [
+    ('identity', torch.bfloat16, 13,    2560,   8,   8,    4),
+]
+
 def brute_force():
     ACT_FNS = ['identity']
-    DTYPES = [torch.float]
+    DTYPES = [torch.bfloat16]
     Bs = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 16)
     Cs = (
         1, 2, 3, 4, 5, 6, 7, 32, 64, 128, 256, 512,
@@ -244,11 +239,15 @@ def test_inputs(inputs, upcast_errors=True):
 if __name__ == '__main__':
     torch.set_printoptions(sci_mode=False, edgeitems=1)
     inputs = CUSTOM_INPUTS
-    inputs = brute_force()
+    #inputs = brute_force()
     err_inputs = test_inputs(inputs)
 
     if len(err_inputs) > 0:
-        print(red('Error inputs found:'))
-        print(err_inputs)
+        print(red('Error inputs found, writing to err_inputs.txt'))
+        with open('err_inputs.txt', 'w') as f:
+            f.write('[\n')
+            f.write(',\n'.join(map(str, err_inputs)))
+            f.write('\n]')
+        f.close()
     else:
         print(green('No errors found :)'))
